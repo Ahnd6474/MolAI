@@ -19,6 +19,26 @@ Start JupyterLab with:
 uv run jupyter lab
 ```
 
+### NVIDIA CUDA container
+
+The remote GPU environment is pinned to the CUDA 13.2 PyTorch wheel and an NVIDIA CUDA
+13.2 development image. Build and verify it with:
+
+```bash
+docker compose build
+docker compose run --rm molai python scripts/check_environment.py --skip-data
+```
+
+For an interactive shell with the repository and local `data/` directory mounted:
+
+```bash
+docker compose run --rm molai bash
+```
+
+The host needs a sufficiently recent NVIDIA driver, Docker, and NVIDIA Container Toolkit;
+the host does not need a separate CUDA toolkit. `--gpus all` is supplied by Compose and
+`ipc: host` avoids the small default shared-memory limit during multi-worker training.
+
 Competition files belong in `data/` and are intentionally ignored by Git:
 
 - `data/train.parquet`

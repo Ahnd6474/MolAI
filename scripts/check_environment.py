@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import platform
 from pathlib import Path
 
@@ -29,6 +30,8 @@ def check_torch() -> None:
     result = lhs @ rhs
     torch.cuda.synchronize()
     print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU capability: {torch.cuda.get_device_capability(0)}")
+    print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 2**30:.1f} GiB")
     print(f"GPU smoke test: {result.shape=} {result.device=}")
 
 
@@ -63,8 +66,20 @@ def check_data() -> None:
         print(f"{filename}: {row_count:,} rows, {len(schema)} columns")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--skip-data",
+        action="store_true",
+        help="check Python, Torch/CUDA, and RDKit without mounted competition files",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     check_torch()
     check_rdkit()
-    check_data()
+    if not args.skip_data:
+        check_data()
     print("Environment check passed.")
