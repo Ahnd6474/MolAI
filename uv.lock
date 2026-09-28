@@ -1013,7 +1013,7 @@ wheels = [
 [[package]]
 name = "molai"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
     { name = "ipykernel" },
@@ -1024,6 +1024,7 @@ dependencies = [
     { name = "pandas" },
     { name = "polars" },
     { name = "pyarrow" },
+    { name = "pyyaml" },
     { name = "rdkit" },
     { name = "scikit-learn" },
     { name = "scipy" },
@@ -1049,6 +1050,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.2" },
     { name = "polars", specifier = ">=1.30" },
     { name = "pyarrow", specifier = ">=20.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "rdkit", specifier = "==2026.3.3" },
     { name = "scikit-learn", specifier = ">=1.7" },
     { name = "scipy", specifier = ">=1.15" },

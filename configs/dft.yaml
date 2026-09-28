@@ -1,0 +1,27 @@
+dft:
+  resolution: 128
+  extent: 1.0
+  steps: 160
+  learning_rate: 0.08
+  convergence_tolerance: 0.00005
+  convergence_patience: 6
+  external_softening: 0.055
+  hartree_softening: 0.045
+  initial_density_width: 0.10
+  core_width_scale: 0.70
+  thomas_fermi_weight: 0.50
+  weizsaecker_weight: 0.08
+  hartree_weight: 0.75
+  exchange_weight: 0.65
+  field_tanh_scale: 0.035
+  gradient_clip: 5.0
+
+layout:
+  margin: 0.82
+  target_bond_length: 0.22
+  collapse_hydrogens: true
+
+dataset:
+  batch_size: 4
+  shard_size: 256
+  storage_dtype: float16
