@@ -1,0 +1,42 @@
+[project]
+name = "molai"
+version = "0.1.0"
+description = "Enveda CASMI 2026 molecule identification workspace"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "duckdb>=1.4",
+    "ipykernel>=7.0",
+    "jupyterlab>=4.4",
+    "kaggle>=1.8",
+    "matplotlib>=3.10",
+    "numpy>=2.2",
+    "pandas>=2.2",
+    "polars>=1.30",
+    "pyarrow>=20.0",
+    "rdkit==2026.3.3",
+    "scikit-learn>=1.7",
+    "scipy>=1.15",
+    "seaborn>=0.13",
+    "torch==2.14.0",
+    "tqdm>=4.67",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "ruff>=0.12",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
