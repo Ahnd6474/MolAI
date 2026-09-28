@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -75,20 +76,40 @@ def main() -> None:
         print(f"Saved {args.output.resolve()}")
         return
 
+    extent = (-config.extent, config.extent, -config.extent, config.extent)
+    physical_signed = result.signed_density[0, 0]
+    fused_signed = result.fused_signed_density[0, 0]
+    physical_limit = float(physical_signed.abs().quantile(0.995))
+    fused_limit = float(fused_signed.abs().quantile(0.995))
     panels = (
         (density, "Kohn-Sham density", "viridis", None),
-        (deformation, "Deformation density", "coolwarm", deformation_limit),
+        (result.promolecule_density[0, 0], "Isolated-atom SCF reference", "viridis", None),
+        (deformation, "Deformation: KS - reference", "coolwarm", deformation_limit),
         (localization, "Electron localization", "magma", None),
         (result.bond_order_density[0, 0], "Projected bond order", "magma", None),
         (homo, f"HOMO orbital {homo_index}", "coolwarm", float(homo.abs().max())),
-        (result.field[0, 0], "Fused scalar field", "inferno", None),
+        (physical_signed, "Physical signed density", "coolwarm", physical_limit),
+        (fused_signed, "Charge-neutral fused density", "coolwarm", fused_limit),
     )
-    figure, axes = plt.subplots(1, 6, figsize=(24, 4), constrained_layout=True)
-    for axis, (image, title, color_map, symmetric_limit) in zip(axes, panels, strict=True):
+    figure, axes = plt.subplots(2, 4, figsize=(16, 8), constrained_layout=True)
+    atom_coordinates = molecule.coordinates
+    for axis, (image, title, color_map, symmetric_limit) in zip(
+        axes.flat, panels, strict=True
+    ):
         options = {}
         if symmetric_limit is not None and color_map == "coolwarm":
             options = {"vmin": -symmetric_limit, "vmax": symmetric_limit}
-        artist = axis.imshow(image.detach().cpu(), origin="lower", cmap=color_map, **options)
+        artist = axis.imshow(
+            image.detach().cpu(), origin="lower", cmap=color_map, extent=extent, **options
+        )
+        axis.scatter(
+            atom_coordinates[:, 0],
+            atom_coordinates[:, 1],
+            marker="x",
+            s=18,
+            linewidths=0.8,
+            color="white" if color_map != "coolwarm" else "black",
+        )
         axis.set_title(title)
         axis.set_axis_off()
         figure.colorbar(artist, ax=axis, fraction=0.046, pad=0.04)
@@ -99,7 +120,37 @@ def main() -> None:
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(args.output, dpi=160)
+    area = (2.0 * config.extent / (config.resolution - 1)) ** 2
+    report = {
+        "smiles": molecule.canonical_smiles,
+        "resolution": config.resolution,
+        "grid_spacing": 2.0 * config.extent / (config.resolution - 1),
+        "electron_count": molecule.electron_count,
+        "nuclear_charge_integral": float(result.core_density[0, 0].sum() * area),
+        "ks_density_integral": float(density.sum() * area),
+        "promolecule_integral": float(result.promolecule_density[0, 0].sum() * area),
+        "deformation_integral": float(deformation.sum() * area),
+        "deformation_positive_integral": float(deformation.clamp_min(0.0).sum() * area),
+        "deformation_negative_integral": float(deformation.clamp_max(0.0).sum() * area),
+        "physical_signed_integral": float(physical_signed.sum() * area),
+        "fused_electron_integral": float(result.fused_electron_density[0, 0].sum() * area),
+        "fused_signed_integral": float(fused_signed.sum() * area),
+        "scf_iterations": result.iterations,
+        "converged": result.converged,
+        "final_density_change": result.final_density_change,
+        "reference_scf_iterations": result.reference_iterations,
+        "reference_converged": result.reference_converged,
+        "reference_final_density_change": result.reference_final_density_change,
+        "feature_weights": {
+            "deformation": config.deformation_weight,
+            "localization": config.localization_weight,
+            "bond_order": config.bond_order_weight,
+        },
+    }
+    report_path = args.output.with_suffix(".json")
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"Saved {args.output.resolve()}")
+    print(f"Saved {report_path.resolve()}")
 
 
 if __name__ == "__main__":

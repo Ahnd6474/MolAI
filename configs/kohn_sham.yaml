@@ -1,7 +1,8 @@
 kohn_sham:
   resolution: 192
   extent: 1.0
-  scf_iterations: 36
+  scf_iterations: 96
+  reference_scf_iterations: 64
   orbital_steps: 20
   imaginary_time_step: 0.0025
   density_mixing: 0.35
@@ -13,6 +14,9 @@ kohn_sham:
   hartree_weight: 0.75
   exchange_weight: 0.65
   softsign_scale: 96.0
+  deformation_weight: 0.20
+  localization_weight: 0.20
+  bond_order_weight: 0.25
   orbital_probe_width: 0.075
   bond_ridge_width: 0.035
   bond_cutoff_ratio: 1.40

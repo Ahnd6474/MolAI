@@ -16,7 +16,8 @@ from molai.dft.solver import DFT2DConfig, OrbitalFreeDFT2D
 class KohnSham2DConfig:
     resolution: int = 96
     extent: float = 1.0
-    scf_iterations: int = 36
+    scf_iterations: int = 96
+    reference_scf_iterations: int = 64
     orbital_steps: int = 20
     imaginary_time_step: float = 0.0025
     density_mixing: float = 0.35
@@ -28,6 +29,9 @@ class KohnSham2DConfig:
     hartree_weight: float = 0.75
     exchange_weight: float = 0.65
     softsign_scale: float = 96.0
+    deformation_weight: float = 0.20
+    localization_weight: float = 0.20
+    bond_order_weight: float = 0.25
     orbital_probe_width: float = 0.075
     bond_ridge_width: float = 0.035
     bond_cutoff_ratio: float = 1.40
@@ -41,8 +45,11 @@ class KohnSham2DConfig:
 class KohnSham2DResult:
     field: Tensor
     signed_density: Tensor
+    fused_signed_density: Tensor
     electron_density: Tensor
+    fused_electron_density: Tensor
     core_density: Tensor
+    promolecule_density: Tensor
     deformation_density: Tensor
     electron_localization: Tensor
     bond_order_density: Tensor
@@ -54,12 +61,34 @@ class KohnSham2DResult:
     iterations: int
     converged: bool
     final_density_change: float
+    reference_iterations: int
+    reference_converged: bool
+    reference_final_density_change: float
+
+
+@dataclass(slots=True)
+class _SCFState:
+    external: Tensor
+    orbitals: Tensor
+    orbital_energies: Tensor
+    occupancies: Tensor
+    density: Tensor
+    iterations: int
+    converged: bool
+    final_density_change: float
 
 
 class KohnSham2D:
     """Solve occupied 2D Kohn-Sham orbitals by split-step imaginary time."""
 
     def __init__(self, config: KohnSham2DConfig, device: torch.device | str) -> None:
+        feature_weights = (
+            config.deformation_weight,
+            config.localization_weight,
+            config.bond_order_weight,
+        )
+        if any(weight < 0.0 for weight in feature_weights) or sum(feature_weights) > 1.0:
+            raise ValueError("feature weights must be non-negative and sum to at most one")
         self.config = config
         self.device = torch.device(device)
         backend_config = DFT2DConfig(
@@ -162,6 +191,121 @@ class KohnSham2D:
     def _density(self, orbitals: Tensor, occupancies: Tensor) -> Tensor:
         return (orbitals.square() * occupancies[:, :, None, None]).sum(dim=1)
 
+    def _normalize_density(self, density: Tensor, electron_counts: Tensor) -> Tensor:
+        """Normalize a non-negative density to the requested electron count."""
+
+        normalization = density.sum(dim=(-2, -1), keepdim=True) * self.pixel_area
+        return density * electron_counts[:, None, None] / normalization.clamp_min(1e-12)
+
+    def _isolated_atom_batch(self, batch: NuclearBatch) -> tuple[NuclearBatch, Tensor]:
+        """Expand a molecular batch into neutral one-pseudo-atom SCF systems."""
+
+        owners, atom_indices = torch.nonzero(batch.atom_mask, as_tuple=True)
+        coordinates = batch.coordinates[owners, atom_indices][:, None, :]
+        charges = batch.effective_charges[owners, atom_indices][:, None]
+        widths = batch.softening_widths[owners, atom_indices][:, None]
+        count = len(owners)
+        atom_batch = NuclearBatch(
+            coordinates=coordinates,
+            effective_charges=charges,
+            softening_widths=widths,
+            atom_mask=torch.ones(count, 1, device=self.device, dtype=torch.bool),
+            electron_counts=charges[:, 0].clone(),
+            formal_charges=torch.zeros(count, device=self.device),
+            canonical_smiles=tuple("[pseudo-atom]" for _ in range(count)),
+            inchikey14=tuple("" for _ in range(count)),
+        )
+        return atom_batch, owners
+
+    def _promolecule_density(
+        self, batch: NuclearBatch
+    ) -> tuple[Tensor, Tensor, _SCFState]:
+        """Sum independently converged neutral pseudo-atoms on the molecular grid.
+
+        The isolated atoms use exactly the molecular grid, pseudo-potential, SCF
+        functional, and in-molecule coordinates.  The Gaussian density used by the
+        solver remains only an initial SCF guess and is not the deformation reference.
+        """
+
+        atom_batch, owners = self._isolated_atom_batch(batch)
+        atom_state = self._run_scf(
+            atom_batch,
+            radial_density=True,
+            max_iterations=self.config.reference_scf_iterations,
+        )
+        atom_densities = atom_state.density
+        promolecule = torch.zeros_like(batch.electron_counts[:, None, None]).expand(
+            -1, self.config.resolution, self.config.resolution
+        ).clone()
+        promolecule.index_add_(0, owners, atom_densities)
+        return promolecule, atom_densities, atom_state
+
+    def _radially_average_atom_densities(
+        self, densities: Tensor, atom_batch: NuclearBatch
+    ) -> Tensor:
+        """Remove arbitrary open-shell orbital orientation from atomic references.
+
+        Free-atom promolecules conventionally use a rotationally averaged density.
+        Radial binning makes the reference invariant to the arbitrary eigenvectors
+        selected inside degenerate atomic orbital subspaces.
+        """
+
+        displacement = self.backend.grid[None] - atom_batch.coordinates[:, 0, None, None, :]
+        radial_position = displacement.square().sum(dim=-1).sqrt() / self.spacing
+        max_bins = self.config.resolution * 2 + 1
+        lower = radial_position.floor().long().clamp_max(max_bins - 2)
+        upper = lower + 1
+        upper_weight = radial_position - lower
+        lower_weight = 1.0 - upper_weight
+        profiles = torch.zeros(len(densities), max_bins, device=self.device)
+        counts = torch.zeros_like(profiles)
+        for indices, weights in ((lower, lower_weight), (upper, upper_weight)):
+            profiles.scatter_add_(
+                1, indices.flatten(1), (densities * weights).flatten(1)
+            )
+            counts.scatter_add_(1, indices.flatten(1), weights.flatten(1))
+        profiles = profiles / counts.clamp_min(1e-12)
+        averaged = (
+            torch.gather(profiles, 1, lower.flatten(1)).reshape_as(densities) * lower_weight
+            + torch.gather(profiles, 1, upper.flatten(1)).reshape_as(densities) * upper_weight
+        )
+        return self._normalize_density(averaged, atom_batch.electron_counts)
+
+    def _fused_electron_density(
+        self,
+        density: Tensor,
+        deformation: Tensor,
+        localization: Tensor,
+        bond_order: Tensor,
+        electron_counts: Tensor,
+    ) -> Tensor:
+        """Fuse complementary chemical detail without changing total charge.
+
+        Every non-negative component is normalized to the same electron count before
+        a convex combination is formed.  Consequently the engineered representation
+        retains exact neutrality when subtracted from the nuclear charge density.
+        """
+
+        weights = (
+            self.config.deformation_weight,
+            self.config.localization_weight,
+            self.config.bond_order_weight,
+        )
+        # The tiny density fallback also makes monatomic/no-bond cases well-defined.
+        fallback = 1e-12 * density
+        accumulation = self._normalize_density(
+            deformation.clamp_min(0.0) + fallback, electron_counts
+        )
+        localized = self._normalize_density(density * localization + fallback, electron_counts)
+        bonded = self._normalize_density(density * bond_order + fallback, electron_counts)
+        base_weight = 1.0 - sum(weights)
+        return (
+            base_weight * density
+            + weights[0] * accumulation
+            + weights[1] * localized
+            + weights[2] * bonded
+        )
+
     def _effective_potential(self, density: Tensor, external: Tensor) -> Tensor:
         hartree = self.backend._hartree_potential(density)
         exchange_coefficient = 4.0 * math.sqrt(2.0) / (3.0 * math.sqrt(math.pi))
@@ -248,19 +392,27 @@ class KohnSham2D:
                 output[batch_index] += weight * ridge
         return output / output.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
 
-    def solve(self, batch: NuclearBatch) -> KohnSham2DResult:
+    def _run_scf(
+        self,
+        batch: NuclearBatch,
+        *,
+        radial_density: bool = False,
+        max_iterations: int = 0,
+    ) -> _SCFState:
         external, _, atomic_density = self.backend._nuclear_fields(batch)
-        core = self._nuclear_charge_density(batch)
         occupancies = self._occupancies(batch.electron_counts)
         orbitals = self._initialize_orbitals(atomic_density, occupancies.shape[1])
         density = atomic_density
+        if radial_density:
+            density = self._radially_average_atom_densities(density, batch)
         stable_steps = 0
         final_change = float("inf")
         converged = False
-        iterations = self.config.scf_iterations
+        iteration_limit = max_iterations or self.config.scf_iterations
+        iterations = iteration_limit
 
         with torch.no_grad():
-            for scf_step in range(self.config.scf_iterations):
+            for scf_step in range(iteration_limit):
                 potential = self._effective_potential(density, external)
                 for _ in range(self.config.orbital_steps):
                     orbitals = self._propagate(orbitals, potential)
@@ -273,12 +425,9 @@ class KohnSham2D:
                 )
                 energies = torch.gather(energies, 1, order)
                 new_density = self._density(orbitals, occupancies)
-                normalization = new_density.sum(dim=(-2, -1), keepdim=True) * self.pixel_area
-                new_density = (
-                    new_density
-                    * batch.electron_counts[:, None, None]
-                    / normalization.clamp_min(1e-8)
-                )
+                new_density = self._normalize_density(new_density, batch.electron_counts)
+                if radial_density:
+                    new_density = self._radially_average_atom_densities(new_density, batch)
                 final_change = float(
                     (
                         (new_density - density).abs().sum(dim=(-2, -1))
@@ -299,36 +448,73 @@ class KohnSham2D:
                     stable_steps = 0
 
             density = self._density(orbitals, occupancies)
-            density = (
-                density
-                * batch.electron_counts[:, None, None]
-                / (density.sum(dim=(-2, -1), keepdim=True) * self.pixel_area).clamp_min(1e-8)
-            )
+            density = self._normalize_density(density, batch.electron_counts)
+            if radial_density:
+                density = self._radially_average_atom_densities(density, batch)
             potential = self._effective_potential(density, external)
             energies = self._orbital_energies(orbitals, potential)
-            deformation = density - atomic_density
-            localization = self._electron_localization(orbitals, occupancies, density)
+
+        return _SCFState(
+            external=external,
+            orbitals=orbitals,
+            orbital_energies=energies,
+            occupancies=occupancies,
+            density=density,
+            iterations=iterations,
+            converged=converged,
+            final_density_change=final_change,
+        )
+
+    def solve(self, batch: NuclearBatch) -> KohnSham2DResult:
+        state = self._run_scf(batch)
+        core = self._nuclear_charge_density(batch)
+
+        with torch.no_grad():
+            promolecule, _, reference_state = self._promolecule_density(batch)
+            density = state.density
+            deformation = density - promolecule
+            localization = self._electron_localization(
+                state.orbitals, state.occupancies, density
+            )
             signed = core - density
-            bond_order_density = self._bond_order_density(orbitals, occupancies, batch)
-            # The unencoded signed density conserves charge. Softsign is only a bounded,
-            # invertible representation for image-space learning.
-            field = (signed / (self.config.softsign_scale + signed.abs()))[:, None]
+            bond_order_density = self._bond_order_density(
+                state.orbitals, state.occupancies, batch
+            )
+            fused_density = self._fused_electron_density(
+                density,
+                deformation,
+                localization,
+                bond_order_density,
+                batch.electron_counts,
+            )
+            fused_signed = core - fused_density
+            # The raw and fused signed densities both conserve charge. Softsign is only
+            # a bounded, invertible representation for image-space learning.
+            field = (
+                fused_signed / (self.config.softsign_scale + fused_signed.abs())
+            )[:, None]
             integrated_charge = signed.sum(dim=(-2, -1)) * self.pixel_area
 
         return KohnSham2DResult(
             field=field,
             signed_density=signed[:, None],
+            fused_signed_density=fused_signed[:, None],
             electron_density=density[:, None],
+            fused_electron_density=fused_density[:, None],
             core_density=core[:, None],
+            promolecule_density=promolecule[:, None],
             deformation_density=deformation[:, None],
             electron_localization=localization[:, None],
             bond_order_density=bond_order_density[:, None],
-            external_potential=external[:, None],
-            orbitals=orbitals,
-            orbital_energies=energies,
-            occupancies=occupancies,
+            external_potential=state.external[:, None],
+            orbitals=state.orbitals,
+            orbital_energies=state.orbital_energies,
+            occupancies=state.occupancies,
             integrated_charge=integrated_charge,
-            iterations=iterations,
-            converged=converged,
-            final_density_change=final_change,
+            iterations=state.iterations,
+            converged=state.converged,
+            final_density_change=state.final_density_change,
+            reference_iterations=reference_state.iterations,
+            reference_converged=reference_state.converged,
+            reference_final_density_change=reference_state.final_density_change,
         )

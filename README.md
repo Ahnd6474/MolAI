@@ -82,10 +82,20 @@ The available targets trade physical fidelity for generation speed:
 All final learning targets are bounded single-channel fields. Positive compact regions
 represent effective nuclei and negative continuous regions represent the electron cloud.
 The Kohn-Sham path deposits each effective nucleus into at most four neighboring pixels
-with charge-conserving bilinear interpolation. A symmetric softsign maps the signed density
-to a bounded image without destroying invertibility. Raw orbital stacks are diagnostics,
-not training targets, because their channel count varies by molecule and orbital phase is
-not a stable image label.
+with charge-conserving bilinear interpolation. Its learning target uses a convex mixture of
+the normalized Kohn-Sham density, positive deformation density, density-weighted electron
+localization, and density-weighted projected bond order. Every component is normalized to
+the same electron count before mixing, so subtracting the fused density from the nuclei
+still integrates to the formal molecular charge. A symmetric softsign maps that signed
+density to a bounded image. The unfused signed density remains available as a physical
+diagnostic, while the fused target is explicitly an engineered representation rather than
+a quantum observable. Deformation density uses a promolecule assembled from independently
+converged neutral pseudo-atoms on the same grid, with the same functional and at their
+in-molecule coordinates. Each atomic result is radially averaged so an arbitrary choice
+inside a degenerate open-shell orbital subspace cannot rotate the reference label; the
+Gaussian density is used only to initialize each SCF solve.
+Raw orbital stacks are diagnostics, not training targets, because their channel count
+varies by molecule and orbital phase is not a stable image label.
 
 The graph-derived renderer builds smooth Gaussian and elliptical primitives on the CPU,
 then pools and rasterizes them in bounded chunks on the selected Torch device. Its fused
