@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from molai.dft.dataset import iter_structure_records
-from molai.fields import ElectronCloud2D, ElectronCloudConfig
+from molai.fields import ExpectedCharge2D, ExpectedChargeConfig
 from molai.models import FieldToSmiles, SmilesTokenizer
 
 
@@ -57,7 +57,7 @@ def render_fields(
     device: torch.device,
     batch_size: int,
 ) -> tuple[torch.Tensor, list[str], int]:
-    renderer = ElectronCloud2D(ElectronCloudConfig(resolution=resolution), device)
+    renderer = ExpectedCharge2D(ExpectedChargeConfig(resolution=resolution), device)
     fields: list[torch.Tensor] = []
     smiles: list[str] = []
     seen: set[str] = set()
@@ -319,7 +319,8 @@ def main() -> None:
         "rendered_structures": len(smiles),
         "render_failures": failures,
         "resolution": args.resolution,
-        "field_config": ElectronCloudConfig(resolution=args.resolution).to_dict(),
+        "field_config": ExpectedChargeConfig(resolution=args.resolution).to_dict(),
+        "representation": "expected_valence_charge",
         "collisions": collisions,
         "image_to_smiles": recovery,
     }
