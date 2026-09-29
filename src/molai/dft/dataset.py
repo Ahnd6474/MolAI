@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import gzip
 import hashlib
 import json
@@ -9,7 +10,6 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-import polars as pl
 import torch
 from rdkit import Chem
 
@@ -31,34 +31,70 @@ def iter_structure_records(
     path: Path,
     smiles_column: str = "normalized_smiles",
     id_column: str = "inchikey14",
+    *,
+    deduplicate_ids: bool = True,
+    parquet_batch_size: int = 65_536,
 ) -> Iterator[StructureRecord]:
-    """Iterate unique structures from parquet, CSV, SMI, or PubChem SDF files."""
+    """Stream structures from Parquet, CSV, SMI, or PubChem SDF files.
+
+    Identifier deduplication is retained for compatibility, but large-scale callers
+    may disable it and deduplicate exact molecular keys downstream.
+    """
 
     suffixes = path.suffixes
+    seen: set[str] | None = set() if deduplicate_ids else None
+
+    def unseen(identifier: str) -> bool:
+        if seen is None:
+            return True
+        if identifier in seen:
+            return False
+        seen.add(identifier)
+        return True
+
     if path.suffix == ".parquet":
-        frame = (
-            pl.scan_parquet(path)
-            .select(id_column, smiles_column)
-            .unique(subset=[id_column], keep="first", maintain_order=True)
-            .collect(engine="streaming")
-        )
-        for identifier, smiles in frame.iter_rows():
-            yield StructureRecord(str(identifier), str(smiles))
+        try:
+            from pyarrow import parquet
+        except ImportError as error:  # pragma: no cover - declared project dependency
+            raise RuntimeError("Parquet streaming requires pyarrow") from error
+        parquet_file = parquet.ParquetFile(path)
+        for batch in parquet_file.iter_batches(
+            batch_size=parquet_batch_size, columns=[id_column, smiles_column]
+        ):
+            columns = batch.to_pydict()
+            for identifier, smiles in zip(
+                columns[id_column], columns[smiles_column], strict=True
+            ):
+                identifier_text = str(identifier)
+                if smiles is not None and unseen(identifier_text):
+                    yield StructureRecord(identifier_text, str(smiles))
         return
-    if path.suffix == ".csv":
-        frame = pl.read_csv(path, columns=[id_column, smiles_column]).unique(
-            subset=[id_column], keep="first", maintain_order=True
-        )
-        for identifier, smiles in frame.iter_rows():
-            yield StructureRecord(str(identifier), str(smiles))
+    if path.suffix == ".csv" or suffixes[-2:] == [".csv", ".gz"]:
+        with (
+            gzip.open(path, "rt", encoding="utf-8", newline="")
+            if path.suffix == ".gz"
+            else path.open("r", encoding="utf-8", newline="")
+        ) as handle:
+            reader = csv.DictReader(handle)
+            for row_number, row in enumerate(reader):
+                smiles = row.get(smiles_column)
+                identifier = row.get(id_column) or str(row_number)
+                if smiles and unseen(identifier):
+                    yield StructureRecord(identifier, smiles)
         return
-    if path.suffix in {".smi", ".smiles", ".txt"}:
-        with path.open("r", encoding="utf-8") as handle:
+    text_suffix = suffixes[-2] if path.suffix == ".gz" and len(suffixes) >= 2 else path.suffix
+    if text_suffix in {".smi", ".smiles", ".txt"}:
+        with (
+            gzip.open(path, "rt", encoding="utf-8")
+            if path.suffix == ".gz"
+            else path.open("r", encoding="utf-8")
+        ) as handle:
             for index, line in enumerate(handle):
                 value = line.strip().split()
                 if value:
                     identifier = value[1] if len(value) > 1 else str(index)
-                    yield StructureRecord(identifier, value[0])
+                    if unseen(identifier):
+                        yield StructureRecord(identifier, value[0])
         return
     if path.suffix == ".sdf" or suffixes[-2:] == [".sdf", ".gz"]:
         with gzip.open(path, "rb") if path.suffix == ".gz" else path.open("rb") as handle:
@@ -72,7 +108,8 @@ def iter_structure_records(
                     if molecule.HasProp("PUBCHEM_COMPOUND_CID")
                     else str(index)
                 )
-                yield StructureRecord(identifier, smiles)
+                if unseen(identifier):
+                    yield StructureRecord(identifier, smiles)
         return
     raise ValueError(f"unsupported structure input: {path}")
 

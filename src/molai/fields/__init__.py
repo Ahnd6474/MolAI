@@ -7,13 +7,17 @@ from molai.fields.electron_cloud import (
     ElectronCloudResult,
 )
 from molai.fields.expected_charge import (
+    CompiledExpectedChargeMolecule,
     ExpectedCharge2D,
     ExpectedChargeBatchResult,
     ExpectedChargeConfig,
     ExpectedChargeResult,
+    ExpectedChargeTrainingBatchResult,
+    TrainingChannel,
 )
 
 __all__ = [
+    "CompiledExpectedChargeMolecule",
     "ElectronCloud2D",
     "ElectronCloudBatchResult",
     "ElectronCloudConfig",
@@ -22,4 +26,6 @@ __all__ = [
     "ExpectedChargeBatchResult",
     "ExpectedChargeConfig",
     "ExpectedChargeResult",
+    "ExpectedChargeTrainingBatchResult",
+    "TrainingChannel",
 ]

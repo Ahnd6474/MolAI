@@ -1,7 +1,13 @@
+import numpy as np
 import pytest
 import torch
 
-from molai.fields import ExpectedCharge2D, ExpectedChargeConfig
+from molai.fields import ExpectedCharge2D, ExpectedChargeConfig, TrainingChannel
+
+ATP4_SMILES = (
+    "C1=NC(=C2C(=N1)N(C=N2)[C@H]3[C@@H]([C@@H]([C@H](O3)"
+    "COP(=O)([O-])OP(=O)([O-])OP(=O)([O-])[O-])O)O)N"
+)
 
 
 @pytest.fixture(scope="module")
@@ -13,7 +19,14 @@ def renderer() -> ExpectedCharge2D:
 
 @pytest.mark.parametrize(
     ("smiles", "formal_charge"),
-    (("O", 0), ("C[NH3+]", 1), ("CC(=O)[O-]", -1), ("c1ccccc1", 0)),
+    (
+        ("O", 0),
+        ("C[NH3+]", 1),
+        ("CC(=O)[O-]", -1),
+        ("c1ccccc1", 0),
+        ("CN1C=NC2=C1C(=O)N(C(=O)N2C)C", 0),
+        (ATP4_SMILES, -4),
+    ),
 )
 def test_expected_charge_conserves_electrons_and_formal_charge(
     renderer: ExpectedCharge2D, smiles: str, formal_charge: int
@@ -83,3 +96,85 @@ def test_batched_render_matches_single_render(renderer: ExpectedCharge2D) -> Non
         single = renderer.render(value)
         torch.testing.assert_close(batch.field[index], single.field)
         torch.testing.assert_close(batch.signed_charge[index], single.signed_charge)
+
+
+@pytest.mark.parametrize(
+    ("channel", "attribute"),
+    (
+        ("field", "field"),
+        ("signed_charge", "signed_charge"),
+        ("electrostatic_potential", "electrostatic_potential"),
+    ),
+)
+def test_training_fast_path_matches_diagnostic_channels(
+    renderer: ExpectedCharge2D, channel: TrainingChannel, attribute: str
+) -> None:
+    smiles = ["CCO", "c1ccccc1", "CC(=O)[O-]"]
+    diagnostic = renderer.render_batch(smiles)
+    training = renderer.render_training_batch(smiles, channel)
+
+    torch.testing.assert_close(training.channel, getattr(diagnostic, attribute))
+    assert training.canonical_smiles == diagnostic.canonical_smiles
+    assert len(training.molecule_keys) == len(smiles)
+
+
+def test_single_atom_molecule_supports_empty_primitive_groups(
+    renderer: ExpectedCharge2D,
+) -> None:
+    result = renderer.render_training_batch(["[He]"], "signed_charge")
+
+    assert result.channel.shape == (1, 1, 80, 80)
+    assert torch.isfinite(result.channel).all()
+
+
+def test_molecule_key_preserves_charge_state(renderer: ExpectedCharge2D) -> None:
+    neutral = renderer.compile_molecule("CC(=O)O")
+    anion = renderer.compile_molecule("CC(=O)[O-]")
+
+    assert neutral.molecule_key != anion.molecule_key
+
+
+def test_electrostatic_potential_matches_direct_g_times_q() -> None:
+    renderer = ExpectedCharge2D(ExpectedChargeConfig(resolution=12), "cpu")
+    charge = torch.zeros(1, 12, 12)
+    source_y, source_x = 3, 7
+    charge[0, source_y, source_x] = 1.0
+
+    potential = renderer._electrostatic_potential(charge)[0]
+    indices = torch.arange(12, dtype=torch.float32)
+    offset_y, offset_x = torch.meshgrid(
+        indices - source_y, indices - source_x, indexing="ij"
+    )
+    radius_squared = (
+        offset_x.square() + offset_y.square()
+    ) * renderer.grid_spacing**2
+    expected = torch.rsqrt(
+        radius_squared + renderer.config.coulomb_softening**2
+    ) * renderer.pixel_area
+    expected = expected - expected.mean()
+
+    torch.testing.assert_close(potential, expected, atol=2e-6, rtol=2e-6)
+
+
+def test_crossing_optimizer_preserves_crossing_free_layout() -> None:
+    original = ExpectedCharge2D(
+        ExpectedChargeConfig(resolution=32, optimize_layout=False), "cpu"
+    ).compile_molecule("CN1C=NC2=C1C(=O)N(C(=O)N2C)C")
+    optimized = ExpectedCharge2D(
+        ExpectedChargeConfig(resolution=32, optimize_layout=True), "cpu"
+    ).compile_molecule("CN1C=NC2=C1C(=O)N(C(=O)N2C)C")
+
+    assert original.bond_crossings == optimized.bond_crossings == 0
+    np.testing.assert_array_equal(original.coordinates, optimized.coordinates)
+
+
+def test_crossing_optimizer_removes_atp_crossing() -> None:
+    original = ExpectedCharge2D(
+        ExpectedChargeConfig(resolution=32, optimize_layout=False), "cpu"
+    ).compile_molecule(ATP4_SMILES)
+    optimized = ExpectedCharge2D(
+        ExpectedChargeConfig(resolution=32, optimize_layout=True), "cpu"
+    ).compile_molecule(ATP4_SMILES)
+
+    assert original.bond_crossings == 1
+    assert optimized.bond_crossings == 0

@@ -110,6 +110,37 @@ Torch shards. `manifest.json` records the source offset, solver configuration ha
 successful and failed records, convergence state, iteration count, final change, integrated
 charge, and solver-specific energy diagnostics.
 
+For large graph-derived pretraining sets, `scripts/generate_expected_charge_dataset.py`
+uses a lower-memory single-channel path. It streams the input, prepares molecules in a CPU
+thread pool, rasterizes full batches on the selected Torch device, and writes resumable
+float16 shards. The default target is the electrostatic potential `G * Q` channel with
+shape `[molecules, 1, resolution, resolution]`; the bounded `field` and raw
+`signed_charge` remain selectable with `--channel`. Raw tensors never contain a color map;
+a small number of `coolwarm` PNGs is written separately for visual validation.
+The default 128×128 renderer preserves full hydrogen influence. It first uses the original
+deterministic layout, counts only proper bond crossings, and generates alternative layouts
+only when at least one crossing is present. A replacement is accepted only if it reduces
+that count, so crossing-free molecules retain their original coordinates and information.
+
+```powershell
+uv run python scripts/generate_expected_charge_dataset.py `
+  --input data/chembl.smi `
+  --output data/expected-charge-128 `
+  --resolution 128 `
+  --batch-size 128 `
+  --shard-size 4096 `
+  --validation-previews 8 `
+  --device cuda
+```
+
+The reader supports Parquet, CSV/CSV.GZ, SMI/SMILES/TXT (optionally GZip-compressed), and
+SDF/SDF.GZ. For tabular files, use `--smiles-column` and `--id-column` to match the source
+schema. Rerunning the same command resumes from the committed source offset. Exact molecular
+InChIKeys are retained in a sidecar index so duplicates can be skipped without holding the
+full input table in memory. For an upstream source that is already guaranteed unique, use
+`--no-deduplicate` to avoid keeping that index in RAM when processing tens of millions of
+records.
+
 Generation is resumable: rerunning with the same source and solver configuration continues
 from the recorded offset. A different source or configuration is rejected to prevent
 incompatible fields from being mixed silently.
