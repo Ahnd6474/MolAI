@@ -54,8 +54,8 @@ def main() -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("distributed Cloud training requires CUDA")
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
         device = torch.device("cuda", local_rank)
+        dist.init_process_group(backend="nccl", device_id=device)
     else:
         device = torch.device(args.device)
     torch.manual_seed(args.seed + rank)

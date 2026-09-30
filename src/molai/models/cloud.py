@@ -130,9 +130,9 @@ class MolecularFieldCloud(nn.Module):
             raise ValueError("current must have shape [B,C,H,W]")
         _, _, height, width = current.shape
         tokens = self.field_embed(current.permute(0, 2, 3, 1))
-        position = sinusoidal_2d_position(height, width, self.dim, current.device, current.dtype)[
-            None
-        ]
+        position = sinusoidal_2d_position(
+            height, width, self.dim, tokens.device, tokens.dtype
+        )[None]
         tokens = tokens + position
         context = self.condition_plane(condition, height, width) + position
         for block in self.condition_blocks:
