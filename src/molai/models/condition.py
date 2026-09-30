@@ -222,8 +222,9 @@ class SegmentAttentionPool(nn.Module):
         denominator = scores.new_zeros(segment_count, self.heads)
         denominator.index_add_(0, segments, weights)
         weights = weights / denominator[segments].clamp_min(1e-12)
-        pooled = values.new_zeros(segment_count, self.heads, self.head_dim)
-        pooled.index_add_(0, segments, weights[..., None] * values)
+        pooled = scores.new_zeros(segment_count, self.heads, self.head_dim)
+        pooled.index_add_(0, segments, weights[..., None] * values.float())
+        pooled = pooled.to(values.dtype)
         return self.output(pooled.reshape(segment_count, -1))
 
 

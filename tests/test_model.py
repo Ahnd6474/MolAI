@@ -164,6 +164,22 @@ def test_spectrum_condition_attention_shapes_and_backward() -> None:
     assert encoder.peak_blocks[0].attention.relative_projection.weight.grad is not None
 
 
+def test_spectrum_condition_attention_supports_bfloat16_autocast() -> None:
+    encoder = SpectrumConditionEncoder(
+        metadata_dim=5,
+        dim=32,
+        heads=4,
+        peak_layers=1,
+        spectrum_layers=1,
+        dropout=0.0,
+    )
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        condition = encoder(*_spectrum_inputs())
+
+    assert condition.shape == (2, 32)
+    assert torch.isfinite(condition).all()
+
+
 def test_spectrum_condition_attention_is_set_invariant() -> None:
     encoder = SpectrumConditionEncoder(
         metadata_dim=5,
