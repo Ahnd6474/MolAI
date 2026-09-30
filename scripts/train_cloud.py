@@ -14,8 +14,8 @@ import yaml
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
-from molai.data import FieldShardDataset, ShardShuffleSampler, collate_field_batch
-from molai.models.bridge import VPSchedule
+from molai.data import ShardShuffleSampler, collate_field_batch, open_field_dataset
+from molai.models.bridge import GeometricVESchedule, VPSchedule
 from molai.models.cloud import MolecularFieldCloud
 from molai.models.condition import SmilesConditionEncoder
 from molai.models.losses import FullBandEnergyDistance
@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("outputs/cloud_pretrain"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--condition-dropout", type=float, default=0.15)
     parser.add_argument("--workers", type=int, default=0)
@@ -60,7 +60,7 @@ def main() -> None:
         device = torch.device(args.device)
     torch.manual_seed(args.seed + rank)
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
-    dataset = FieldShardDataset(args.data)
+    dataset = open_field_dataset(args.data)
     expected_channels = int(config["model"]["field_channels"])
     actual_channels = len(dataset.manifest.get("field_channels", ["signed_charge"]))
     if actual_channels != expected_channels:
@@ -84,9 +84,10 @@ def main() -> None:
         rank=rank,
         replicas=world_size,
     )
+    batch_size = args.batch_size or int(config["cloud_matching"].get("batch_size_per_gpu", 1))
     loader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         sampler=sampler,
         collate_fn=partial(collate_field_batch, tokenizer=tokenizer),
         num_workers=args.workers,
@@ -119,7 +120,16 @@ def main() -> None:
     ).to(device)
     parameters = [*cloud.parameters(), *condition_encoder.parameters()]
     optimizer = torch.optim.AdamW(parameters, lr=args.learning_rate, weight_decay=1e-4)
-    schedule = VPSchedule(device=device)
+    if dataset.manifest.get("format") == "molai-noise-view-v1":
+        noise_config = dataset.manifest["noise_schedule"]
+        schedule: VPSchedule | GeometricVESchedule = GeometricVESchedule(
+            levels=int(noise_config["levels"]),
+            sigma_min=float(noise_config["sigma_min"]),
+            sigma_max=float(noise_config["sigma_max"]),
+            device=device,
+        )
+    else:
+        schedule = VPSchedule(device=device)
     cloud_samples = int(config["cloud_matching"]["samples"])
     cloud_loss = FullBandEnergyDistance(
         levels=int(config["cloud_matching"]["full_band_levels"]),
@@ -155,7 +165,15 @@ def main() -> None:
         for batch in loader:
             clean = batch["field"].to(device, non_blocking=True)
             token_ids = batch["token_ids"].to(device, non_blocking=True)
-            transition = schedule.sample_training_batch(clean, cloud_samples)
+            noise_levels = batch.get("noise_level")
+            if noise_levels is None:
+                transition = schedule.sample_training_batch(clean, cloud_samples)
+            else:
+                transition = schedule.sample_training_batch(
+                    clean,
+                    cloud_samples,
+                    current_levels=noise_levels,
+                )
             condition = condition_runner(token_ids)
             keep = torch.rand(condition.shape[0], 1, device=device) >= args.condition_dropout
             condition = condition * keep

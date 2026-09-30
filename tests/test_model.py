@@ -1,6 +1,6 @@
 import torch
 
-from molai.models.bridge import VPSchedule
+from molai.models.bridge import GeometricVESchedule, VPSchedule
 from molai.models.cloud import MolecularCloudModel, MolecularFieldCloud
 from molai.models.condition import SpectrumConditionEncoder
 from molai.models.image_smiles import FieldToSmiles
@@ -46,6 +46,25 @@ def test_bridge_and_energy_distance() -> None:
     assert bridge.current.shape == clean.shape
     assert bridge.target_cloud.shape == (2, 3, 1, 16, 16)
     assert abs(float(loss)) < 1e-5
+
+
+def test_geometric_noise_bridge_uses_requested_levels() -> None:
+    clean = torch.zeros(3, 1, 8, 8)
+    levels = torch.tensor([1, 16, 64])
+    schedule = GeometricVESchedule(levels=64, sigma_min=0.005, sigma_max=0.5)
+
+    bridge = schedule.sample_training_batch(
+        clean,
+        samples=2,
+        current_levels=levels,
+        clean_answer_probability=1.0,
+    )
+
+    assert bridge.current.shape == clean.shape
+    assert bridge.target_cloud.shape == (3, 2, 1, 8, 8)
+    torch.testing.assert_close(bridge.current_levels, levels)
+    torch.testing.assert_close(bridge.target_cloud, clean[:, None].expand(-1, 2, -1, -1, -1))
+    assert bridge.current[-1].std() > bridge.current[0].std() * 20
 
 
 def test_reused_band_pyramid_matches_direct_error_filtering() -> None:

@@ -3,7 +3,7 @@ from itertools import pairwise
 
 import torch
 
-from molai.data import FieldShardDataset, ShardShuffleSampler
+from molai.data import FieldShardDataset, NoisyFieldDataset, ShardShuffleSampler
 
 
 def test_field_dataset_reads_expected_charge_shards(tmp_path) -> None:
@@ -60,3 +60,49 @@ def test_shard_shuffle_sampler_preserves_shard_locality(tmp_path) -> None:
     assert first != second
     shard_ids = [0 if index < 3 else 1 if index < 5 else 2 for index in first]
     assert len([1 for left, right in pairwise(shard_ids) if left != right]) == 2
+
+
+def test_noise_view_preserves_raw_fields_without_copying(tmp_path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    torch.save(
+        {
+            "field": torch.tensor([[[[-4.0, 0.0], [4.0, 12.0]]]]),
+            "smiles": ["CO"],
+            "inchikey14": ["ABCDEFGHIJKLMN"],
+            "electron_count": torch.tensor([14]),
+            "formal_charge": torch.tensor([0]),
+        },
+        source / "fields-000000.pt",
+    )
+    (source / "manifest.json").write_text(
+        json.dumps({"shards": [{"file": "fields-000000.pt", "records": 1}]}),
+        encoding="utf-8",
+    )
+    view = tmp_path / "noise"
+    view.mkdir()
+    (view / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "molai-noise-view-v1",
+                "source": "../source",
+                "variants_per_field": 1,
+                "seed": 7,
+                "value_space": "raw",
+                "scale_reference": {"type": "rms", "value": 4.0},
+                "noise_schedule": {
+                    "type": "geometric_ve",
+                    "levels": 64,
+                    "sigma_min": 0.04,
+                    "sigma_max": 4.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = NoisyFieldDataset(view)
+    item = dataset[0]
+
+    torch.testing.assert_close(item["field"], torch.tensor([[[-4.0, 0.0], [4.0, 12.0]]]))
+    assert item["noise_level"] in range(1, 65)

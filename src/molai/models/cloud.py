@@ -205,9 +205,7 @@ class MolecularFieldCloud(nn.Module):
         residual = self.max_residual * torch.tanh(self.output_head(self.output_norm(tokens)))
         residual = residual.permute(0, 3, 1, 2)
         expanded_current = current[:, None].expand(-1, samples, -1, -1, -1)
-        fields = (expanded_current.reshape(batch * samples, *current.shape[1:]) + residual).clamp(
-            -1.0, 1.0
-        )
+        fields = expanded_current.reshape(batch * samples, *current.shape[1:]) + residual
         molecular_embeddings = self.readout(tokens.mean(dim=(1, 2)))
         return (
             fields.reshape(batch, samples, *current.shape[1:]),

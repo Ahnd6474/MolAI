@@ -10,14 +10,14 @@ model:
   window_size: 8
   ffn_ratio: 2.0
   max_resolution: 256
-  max_residual: 2.0
+  max_residual: 8.0
   noise_energy_min: 0.0001
   noise_energy_init: 0.1
   noise_amplitude_max: 8.0
   gradient_checkpointing: false
 
 cloud_matching:
+  batch_size_per_gpu: 16
   samples: 4
   loss: energy_full_band
   full_band_levels: 3
-

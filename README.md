@@ -346,6 +346,16 @@ converged.
 
 ### Pretrain the field model
 
+Create a zero-copy noisy view of the raw ESP shards. The view keeps the raw
+potential untouched and spaces 64 Gaussian noise magnitudes geometrically from
+1% to 100% of the dataset RMS:
+
+```bash
+uv run python scripts/prepare_noise_dataset.py \
+  --source data/expected-charge-128 \
+  --output data/expected-charge-128-noise
+```
+
 ```powershell
 uv run python scripts/train_cloud.py `
   --data data/kohn_sham_fields `
@@ -356,7 +366,7 @@ On a dual-GPU host, launch one process per GPU; `--batch-size` is per GPU:
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=2 scripts/train_cloud.py \
-  --data data/expected-charge-128 --config configs/model.yaml --batch-size 8
+  --data data/expected-charge-128-noise --config configs/model.yaml --batch-size 16
 ```
 
 ### Preview Kohn-Sham diagnostics

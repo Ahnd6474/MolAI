@@ -73,12 +73,71 @@ class FieldShardDataset(Dataset[dict[str, object]]):
             yield from payload[key]
 
 
+class NoisyFieldDataset(Dataset[dict[str, object]]):
+    """A zero-copy view that assigns geometric noise levels to clean field records."""
+
+    def __init__(self, root: Path | str, cache_shards: int = 2) -> None:
+        self.root = Path(root)
+        self.manifest = json.loads((self.root / "manifest.json").read_text(encoding="utf-8"))
+        if self.manifest.get("format") != "molai-noise-view-v1":
+            raise ValueError("not a molai noise-view dataset")
+        source_path = Path(str(self.manifest["source"])).expanduser()
+        if not source_path.is_absolute():
+            source_path = (self.root / source_path).resolve()
+        self.source = FieldShardDataset(source_path, cache_shards=cache_shards)
+        self.variants = int(self.manifest.get("variants_per_field", 1))
+        self.levels = int(self.manifest["noise_schedule"]["levels"])
+        self.seed = int(self.manifest.get("seed", 0))
+        if self.variants < 1 or self.levels < 2:
+            raise ValueError("noise variants must be positive and levels must be at least two")
+        self.shards = [
+            {**shard, "records": int(shard["records"]) * self.variants}
+            for shard in self.source.shards
+        ]
+        self.ends: list[int] = []
+        total = 0
+        for shard in self.shards:
+            total += int(shard["records"])
+            self.ends.append(total)
+
+    def __len__(self) -> int:
+        return len(self.source) * self.variants
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        source_index, variant = divmod(index, self.variants)
+        item = dict(self.source[source_index])
+        mixed = (
+            (source_index + 1) * 0x9E3779B185EBCA87
+            + (variant + 1) * 0xC2B2AE3D27D4EB4F
+            + self.seed
+        ) & ((1 << 64) - 1)
+        item["noise_level"] = 1 + mixed % self.levels
+        return item
+
+    def iter_smiles(self) -> Iterator[str]:
+        return self.source.iter_smiles()
+
+
+def open_field_dataset(
+    root: Path | str, cache_shards: int = 2
+) -> FieldShardDataset | NoisyFieldDataset:
+    root = Path(root)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("format") == "molai-noise-view-v1":
+        return NoisyFieldDataset(root, cache_shards=cache_shards)
+    return FieldShardDataset(root, cache_shards=cache_shards)
+
+
 class ShardShuffleSampler(Sampler[int]):
     """Shuffle records while visiting each large tensor shard only once per epoch."""
 
     def __init__(
         self,
-        dataset: FieldShardDataset,
+        dataset: FieldShardDataset | NoisyFieldDataset,
         *,
         seed: int = 0,
         rank: int = 0,
@@ -130,9 +189,14 @@ def collate_field_batch(
     token_ids = torch.full((len(batch), max_length), tokenizer.pad_id, dtype=torch.long)
     for index, values in enumerate(encoded):
         token_ids[index, : len(values)] = torch.tensor(values)
-    return {
+    output: dict[str, Tensor | list[str]] = {
         "field": torch.stack([item["field"] for item in batch]),
         "token_ids": token_ids,
         "smiles": [str(item["smiles"]) for item in batch],
         "inchikey14": [str(item["inchikey14"]) for item in batch],
     }
+    if "noise_level" in batch[0]:
+        output["noise_level"] = torch.tensor(
+            [int(item["noise_level"]) for item in batch], dtype=torch.long
+        )
+    return output
