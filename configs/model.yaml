@@ -23,3 +23,24 @@ cloud_matching:
   clean_answer_probability: 0.25
   loss: energy_full_band
   full_band_levels: 3
+
+training:
+  epochs: 120
+  learning_rate: 0.0001
+  min_learning_rate: 0.00001
+  validation_fraction: 0.02
+  condition_dropout: 0.15
+  peak_chunk_size: 256
+  log_every: 1
+
+spectrum_encoder:
+  fourier_bands: 12
+  heads: 8
+  peak_layers: 3
+  spectrum_layers: 2
+  relative_bands: 16
+  relative_mass_max: 256.0
+  ffn_ratio: 2.0
+  dropout: 0.1
+  max_mz: 1500.0
+  peak_chunk_batch: 256

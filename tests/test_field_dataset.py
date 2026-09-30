@@ -3,7 +3,13 @@ from itertools import pairwise
 
 import torch
 
-from molai.data import FieldShardDataset, NoisyFieldDataset, ShardShuffleSampler
+from molai.data import (
+    FieldShardDataset,
+    NoisyFieldDataset,
+    ShardShuffleSampler,
+    SpectrumFieldDataset,
+    collate_spectrum_field_batch,
+)
 
 
 def test_field_dataset_reads_expected_charge_shards(tmp_path) -> None:
@@ -133,3 +139,94 @@ def test_shard_sampler_pads_each_rank_to_full_batches(tmp_path) -> None:
     assert len(rank_zero) == len(rank_one) == 12
     assert set(combined) == set(range(records))
     assert len(combined) - len(set(combined)) == 7
+
+
+def test_shard_sampler_molecule_split_is_disjoint(tmp_path) -> None:
+    records = 100
+    torch.save(
+        {
+            "field": torch.zeros(records, 1, 2, 2),
+            "smiles": ["C"] * records,
+            "inchikey14": ["ABCDEFGHIJKLMN"] * records,
+            "electron_count": torch.ones(records),
+            "formal_charge": torch.zeros(records),
+        },
+        tmp_path / "fields-000000.pt",
+    )
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"shards": [{"file": "fields-000000.pt", "records": records}]}),
+        encoding="utf-8",
+    )
+    dataset = FieldShardDataset(tmp_path)
+    train = ShardShuffleSampler(
+        dataset, split="train", validation_fraction=0.2, split_seed=23
+    )
+    validation = ShardShuffleSampler(
+        dataset,
+        split="validation",
+        validation_fraction=0.2,
+        split_seed=23,
+        shuffle=False,
+    )
+
+    train_indices = set(train)
+    validation_indices = set(validation)
+
+    assert train_indices.isdisjoint(validation_indices)
+    assert train_indices | validation_indices == set(range(records))
+    assert 10 <= len(validation_indices) <= 30
+
+
+def test_spectrum_field_dataset_decodes_and_collates(tmp_path) -> None:
+    fields = tmp_path / "fields"
+    fields.mkdir()
+    torch.save(
+        {
+            "field": torch.zeros(2, 1, 4, 4),
+            "smiles": ["CO", "CCO"],
+            "inchikey14": ["ABCDEFGHIJKLMN", "NOPQRSTUVWXYZ"],
+            "electron_count": torch.tensor([14, 20]),
+            "formal_charge": torch.tensor([0, 0]),
+        },
+        fields / "fields-000000.pt",
+    )
+    (fields / "manifest.json").write_text(
+        json.dumps({"shards": [{"file": "fields-000000.pt", "records": 2}]}),
+        encoding="utf-8",
+    )
+
+    spectra = tmp_path / "spectra"
+    spectra.mkdir()
+    torch.save(
+        {
+            "mz": torch.tensor([100.0, 200.0, 150.0, 250.0]),
+            "intensity": torch.tensor([0.5, 1.0, 0.8, 0.6], dtype=torch.float16),
+            "peak_offsets": torch.tensor([0, 2, 3, 4]),
+            "spectrum_offsets": torch.tensor([0, 1, 3]),
+            "metadata": torch.zeros(3, 6, dtype=torch.float16),
+            "precursor_mz": torch.tensor([300.0, 400.0, 450.0]),
+        },
+        spectra / "spectra-000000.pt",
+    )
+    (spectra / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "molai-spectrum-field-v1",
+                "field_source": "../fields",
+                "records": 2,
+                "metadata_dim": 6,
+                "shards": [{"file": "spectra-000000.pt", "records": 2}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = SpectrumFieldDataset(spectra)
+    batch = collate_spectrum_field_batch([dataset[0], dataset[1]], peak_chunk_size=2)
+
+    assert batch["peak_chunks"].shape == (3, 2, 2)
+    assert batch["peak_mask"].sum() == 4
+    assert batch["chunk_to_spectrum"].tolist() == [0, 1, 2]
+    assert batch["spectrum_to_molecule"].tolist() == [0, 1, 1]
+    assert batch["metadata"].shape == (3, 6)
+    assert float(batch["peak_chunks"][0, 1, 1]) == 1.0

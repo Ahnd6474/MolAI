@@ -197,7 +197,7 @@ def test_spectrum_condition_attention_is_set_invariant() -> None:
     torch.testing.assert_close(spectrum_permuted, expected, atol=2e-6, rtol=2e-6)
 
 
-def test_spectrum_condition_attention_keeps_strongest_peaks() -> None:
+def test_spectrum_condition_attention_uses_all_peak_chunks() -> None:
     encoder = SpectrumConditionEncoder(
         metadata_dim=2,
         dim=16,
@@ -223,6 +223,6 @@ def test_spectrum_condition_attention_keeps_strongest_peaks() -> None:
         metadata,
         precursor_mz,
     )
-    selected = encoder(peaks, peak_mask, spectrum_mask, metadata, precursor_mz)
+    complete = encoder(peaks, peak_mask, spectrum_mask, metadata, precursor_mz)
 
-    torch.testing.assert_close(selected, truncated, atol=2e-6, rtol=2e-6)
+    assert not torch.allclose(complete, truncated, atol=2e-6, rtol=2e-6)

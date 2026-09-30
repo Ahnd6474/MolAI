@@ -188,6 +188,62 @@ class RelativeMassTransformerBlock(nn.Module):
         return tokens.masked_fill(~mask.unsqueeze(-1), 0.0)
 
 
+class SegmentAttentionPool(nn.Module):
+    """Multi-head learned-query attention over variable-length tensor segments."""
+
+    def __init__(self, dim: int, heads: int) -> None:
+        super().__init__()
+        if dim % heads:
+            raise ValueError("pooling dimension must be divisible by heads")
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.norm = nn.LayerNorm(dim)
+        self.key = nn.Linear(dim, dim)
+        self.value = nn.Linear(dim, dim)
+        self.query = nn.Parameter(torch.randn(heads, self.head_dim) * 0.02)
+        self.output = nn.Linear(dim, dim)
+
+    def forward(self, tokens: Tensor, segments: Tensor, segment_count: int) -> Tensor:
+        if tokens.ndim != 2 or segments.shape != tokens.shape[:1]:
+            raise ValueError("tokens must be [N,D] and segments must be [N]")
+        normalized = self.norm(tokens)
+        keys = self.key(normalized).reshape(-1, self.heads, self.head_dim)
+        values = self.value(normalized).reshape(-1, self.heads, self.head_dim)
+        scores = (keys * self.query[None]).sum(dim=-1) / math.sqrt(self.head_dim)
+        maximum = scores.new_full((segment_count, self.heads), -torch.inf)
+        maximum.scatter_reduce_(
+            0,
+            segments[:, None].expand(-1, self.heads),
+            scores,
+            reduce="amax",
+            include_self=True,
+        )
+        weights = (scores - maximum[segments]).exp()
+        denominator = scores.new_zeros(segment_count, self.heads)
+        denominator.index_add_(0, segments, weights)
+        weights = weights / denominator[segments].clamp_min(1e-12)
+        pooled = values.new_zeros(segment_count, self.heads, self.head_dim)
+        pooled.index_add_(0, segments, weights[..., None] * values)
+        return self.output(pooled.reshape(segment_count, -1))
+
+
+class SetFeedForwardBlock(nn.Module):
+    def __init__(self, dim: int, ffn_ratio: float, dropout: float) -> None:
+        super().__init__()
+        hidden = int(dim * ffn_ratio)
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        return tokens + self.ffn(tokens)
+
+
 class SpectrumConditionEncoder(nn.Module):
     """Hierarchical attention encoder for sparse peaks and replicate spectra."""
 
@@ -205,13 +261,18 @@ class SpectrumConditionEncoder(nn.Module):
         dropout: float = 0.1,
         max_mz: float = 1_500.0,
         max_peaks: int = 256,
+        peak_chunk_batch: int = 256,
     ) -> None:
         super().__init__()
         if dim % heads:
             raise ValueError("dim must be divisible by heads")
         if max_peaks < 1:
             raise ValueError("max_peaks must be positive")
+        if peak_chunk_batch < 1:
+            raise ValueError("peak_chunk_batch must be positive")
         self.max_peaks = max_peaks
+        self.peak_chunk_size = max_peaks
+        self.peak_chunk_batch = peak_chunk_batch
         self.max_mz = max_mz
         self.peak_embedding = ContinuousPeakEmbedding(
             dim,
@@ -237,20 +298,11 @@ class SpectrumConditionEncoder(nn.Module):
                 for _ in range(peak_layers)
             ]
         )
-        spectrum_layer = nn.TransformerEncoderLayer(
-            dim,
-            heads,
-            dim_feedforward=int(dim * ffn_ratio),
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.chunk_pool = SegmentAttentionPool(dim, heads)
+        self.spectrum_blocks = nn.ModuleList(
+            [SetFeedForwardBlock(dim, ffn_ratio, dropout) for _ in range(spectrum_layers)]
         )
-        self.spectrum_encoder = nn.TransformerEncoder(
-            spectrum_layer,
-            num_layers=spectrum_layers,
-            enable_nested_tensor=False,
-        )
+        self.spectrum_pool = SegmentAttentionPool(dim, heads)
         self.molecule_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         self.output = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim))
 
@@ -285,63 +337,118 @@ class SpectrumConditionEncoder(nn.Module):
         self._validate_inputs(peaks, peak_mask, spectrum_mask, metadata, precursor_mz)
         peak_mask = peak_mask.bool()
         spectrum_mask = spectrum_mask.bool()
-        if peaks.shape[2] > self.max_peaks:
-            ranking = torch.nan_to_num(peaks[..., 1], nan=-torch.inf)
-            ranking = ranking.masked_fill(~peak_mask, -torch.inf)
-            indices = ranking.topk(self.max_peaks, dim=2).indices
-            peaks = peaks.gather(2, indices.unsqueeze(-1).expand(-1, -1, -1, 2))
-            peak_mask = peak_mask.gather(2, indices)
-        batch, spectra, peaks_per_spectrum, _ = peaks.shape
-        mz = torch.nan_to_num(
-            peaks[..., 0], nan=0.0, posinf=self.max_mz, neginf=0.0
-        )
-        intensity = torch.nan_to_num(peaks[..., 1], nan=0.0, posinf=1.0, neginf=0.0)
         if precursor_mz is None:
-            masked_mz = mz.masked_fill(~peak_mask, 0.0)
+            masked_mz = peaks[..., 0].masked_fill(~peak_mask, 0.0)
             precursor_mz = masked_mz.amax(dim=-1)
+        chunks: list[Tensor] = []
+        chunk_masks: list[Tensor] = []
+        chunk_to_spectrum: list[int] = []
+        spectrum_to_molecule: list[int] = []
+        metadata_parts: list[Tensor] = []
+        precursor_parts: list[Tensor] = []
+        spectrum_index = 0
+        for batch_index in range(peaks.shape[0]):
+            for local_spectrum in range(peaks.shape[1]):
+                if not bool(spectrum_mask[batch_index, local_spectrum]):
+                    continue
+                values = peaks[batch_index, local_spectrum][
+                    peak_mask[batch_index, local_spectrum]
+                ]
+                values = values[values[:, 0].argsort()]
+                for start in range(0, len(values), self.peak_chunk_size):
+                    chunk_values = values[start : start + self.peak_chunk_size]
+                    chunk = peaks.new_zeros(self.peak_chunk_size, 2)
+                    mask = torch.zeros(
+                        self.peak_chunk_size, dtype=torch.bool, device=peaks.device
+                    )
+                    chunk[: len(chunk_values)] = chunk_values
+                    mask[: len(chunk_values)] = True
+                    chunks.append(chunk)
+                    chunk_masks.append(mask)
+                    chunk_to_spectrum.append(spectrum_index)
+                metadata_parts.append(metadata[batch_index, local_spectrum])
+                precursor_parts.append(precursor_mz[batch_index, local_spectrum])
+                spectrum_to_molecule.append(batch_index)
+                spectrum_index += 1
+        return self.forward_ragged(
+            torch.stack(chunks),
+            torch.stack(chunk_masks),
+            torch.tensor(chunk_to_spectrum, device=peaks.device),
+            torch.tensor(spectrum_to_molecule, device=peaks.device),
+            torch.stack(metadata_parts),
+            torch.stack(precursor_parts),
+            peaks.shape[0],
+        )
 
-        peak_tokens = self.peak_embedding(mz, intensity, precursor_mz)
+    def forward_ragged(
+        self,
+        peak_chunks: Tensor,
+        peak_mask: Tensor,
+        chunk_to_spectrum: Tensor,
+        spectrum_to_molecule: Tensor,
+        metadata: Tensor,
+        precursor_mz: Tensor,
+        molecule_count: int,
+    ) -> Tensor:
+        """Encode all peaks and spectra from a CSR/chunked batch without truncation."""
+
+        if peak_chunks.ndim != 3 or peak_chunks.shape[-1] != 2:
+            raise ValueError("peak_chunks must have shape [K,P,2]")
+        if peak_mask.shape != peak_chunks.shape[:2]:
+            raise ValueError("peak_mask must have shape [K,P]")
+        spectrum_count = metadata.shape[0]
+        if chunk_to_spectrum.shape != peak_chunks.shape[:1]:
+            raise ValueError("chunk_to_spectrum must have shape [K]")
+        if spectrum_to_molecule.shape != (spectrum_count,):
+            raise ValueError("spectrum_to_molecule must have shape [S]")
+        if precursor_mz.shape != (spectrum_count,):
+            raise ValueError("precursor_mz must have shape [S]")
+
         metadata_tokens = self.metadata_embedding(metadata)
-        peak_tokens = peak_tokens + metadata_tokens.unsqueeze(2)
-        spectrum_tokens = self.spectrum_token.expand(batch, spectra, -1)
-        spectrum_tokens = spectrum_tokens + metadata_tokens
-
-        tokens = torch.cat((spectrum_tokens.unsqueeze(2), peak_tokens), dim=2)
-        token_mask = torch.cat(
-            (
-                torch.ones(
-                    batch,
-                    spectra,
-                    1,
-                    dtype=torch.bool,
-                    device=peaks.device,
+        chunk_embedding_parts: list[Tensor] = []
+        for start in range(0, len(peak_chunks), self.peak_chunk_batch):
+            end = min(start + self.peak_chunk_batch, len(peak_chunks))
+            chunk_slice = peak_chunks[start:end]
+            mask_slice = peak_mask[start:end].bool()
+            mapping_slice = chunk_to_spectrum[start:end]
+            mz = torch.nan_to_num(
+                chunk_slice[..., 0], nan=0.0, posinf=self.max_mz, neginf=0.0
+            )
+            intensity = torch.nan_to_num(
+                chunk_slice[..., 1], nan=0.0, posinf=1.0, neginf=0.0
+            )
+            chunk_precursor = precursor_mz[mapping_slice]
+            chunk_metadata = metadata_tokens[mapping_slice]
+            peak_tokens = self.peak_embedding(mz, intensity, chunk_precursor)
+            peak_tokens = peak_tokens + chunk_metadata[:, None]
+            chunk_tokens = self.spectrum_token.expand(end - start, -1, -1)
+            chunk_tokens = chunk_tokens + chunk_metadata[:, None]
+            tokens = torch.cat((chunk_tokens, peak_tokens), dim=1)
+            token_mask = torch.cat(
+                (
+                    torch.ones(
+                        end - start, 1, dtype=torch.bool, device=peak_chunks.device
+                    ),
+                    mask_slice,
                 ),
-                peak_mask,
-            ),
-            dim=2,
+                dim=1,
+            )
+            masses = torch.cat((chunk_precursor[:, None], mz), dim=1)
+            for block in self.peak_blocks:
+                tokens = block(tokens, masses, token_mask)
+            chunk_embedding_parts.append(tokens[:, 0])
+        chunk_embeddings = torch.cat(chunk_embedding_parts)
+        spectrum_embeddings = self.chunk_pool(
+            chunk_embeddings, chunk_to_spectrum, spectrum_count
         )
-        masses = torch.cat((precursor_mz.unsqueeze(-1), mz), dim=2)
-        flat_tokens = tokens.reshape(batch * spectra, peaks_per_spectrum + 1, -1)
-        flat_masses = masses.reshape(batch * spectra, peaks_per_spectrum + 1)
-        flat_mask = token_mask.reshape(batch * spectra, peaks_per_spectrum + 1)
-        for block in self.peak_blocks:
-            flat_tokens = block(flat_tokens, flat_masses, flat_mask)
-        spectrum_embeddings = flat_tokens[:, 0].reshape(batch, spectra, -1)
-
-        molecule_token = self.molecule_token.expand(batch, -1, -1)
-        molecule_tokens = torch.cat((molecule_token, spectrum_embeddings), dim=1)
-        molecule_mask = torch.cat(
-            (
-                torch.ones(batch, 1, dtype=torch.bool, device=peaks.device),
-                spectrum_mask,
-            ),
-            dim=1,
+        spectrum_embeddings = spectrum_embeddings + metadata_tokens
+        for block in self.spectrum_blocks:
+            spectrum_embeddings = block(spectrum_embeddings)
+        molecule_embeddings = self.spectrum_pool(
+            spectrum_embeddings, spectrum_to_molecule, molecule_count
         )
-        molecule_tokens = self.spectrum_encoder(
-            molecule_tokens,
-            src_key_padding_mask=~molecule_mask,
-        )
-        return self.output(molecule_tokens[:, 0])
+        molecule_embeddings = molecule_embeddings + self.molecule_token[:, 0]
+        return self.output(molecule_embeddings)
 
 
 class AxialConditionPlane(nn.Module):

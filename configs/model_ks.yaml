@@ -23,3 +23,12 @@ cloud_matching:
   clean_answer_probability: 0.25
   loss: energy_full_band
   full_band_levels: 3
+
+training:
+  epochs: 120
+  learning_rate: 0.0001
+  min_learning_rate: 0.00001
+  validation_fraction: 0.02
+  condition_dropout: 0.15
+  peak_chunk_size: 256
+  log_every: 1

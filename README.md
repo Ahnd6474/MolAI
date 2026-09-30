@@ -356,6 +356,17 @@ uv run python scripts/prepare_noise_dataset.py \
   --output data/expected-charge-128-noise
 ```
 
+Pack every MS/MS replicate and every valid peak into CSR shards aligned with
+the field records. There is no per-molecule spectrum cap and no top-k peak
+selection; 256 is only the bounded attention compute chunk size:
+
+```bash
+uv run python scripts/prepare_spectrum_field_dataset.py \
+  --fields data/expected-charge-128-noise \
+  --spectra data/train.parquet \
+  --output data/expected-charge-128-spectrum
+```
+
 ```powershell
 uv run python scripts/train_cloud.py `
   --data data/kohn_sham_fields `
@@ -366,7 +377,16 @@ On a dual-GPU host, launch one process per GPU; `--batch-size` is per GPU:
 
 ```bash
 uv run torchrun --standalone --nproc-per-node=2 scripts/train_cloud.py \
-  --data data/expected-charge-128-noise --config configs/model.yaml --batch-size 16
+  --data data/expected-charge-128-spectrum --config configs/model.yaml --batch-size 16
+```
+
+The default run is 120 epochs with a molecule-level 98/2 train/validation split,
+cosine learning-rate decay from `1e-4` to `1e-5`, and one checkpoint per epoch.
+TensorBoard logs batch loss, gradient norm, learning rate, epoch train/validation
+loss, spectrum/peak counts, and actual/input/output image triptychs:
+
+```bash
+uv run tensorboard --logdir outputs/cloud_pretrain/tensorboard --bind_all
 ```
 
 ### Preview Kohn-Sham diagnostics
