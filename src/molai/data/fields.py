@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 from torch import Tensor
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from molai.models.smiles import SmilesTokenizer
 
@@ -71,6 +71,54 @@ class FieldShardDataset(Dataset[dict[str, object]]):
             payload = self._load_shard(shard_index)
             key = "canonical_smiles" if "canonical_smiles" in payload else "smiles"
             yield from payload[key]
+
+
+class ShardShuffleSampler(Sampler[int]):
+    """Shuffle records while visiting each large tensor shard only once per epoch."""
+
+    def __init__(
+        self,
+        dataset: FieldShardDataset,
+        *,
+        seed: int = 0,
+        rank: int = 0,
+        replicas: int = 1,
+    ) -> None:
+        if replicas < 1 or not 0 <= rank < replicas:
+            raise ValueError("rank must be in [0, replicas)")
+        self.dataset = dataset
+        self.seed = seed
+        self.rank = rank
+        self.replicas = replicas
+        self.epoch = 0
+        self.samples_per_rank = (len(dataset) + replicas - 1) // replicas
+
+    def __len__(self) -> int:
+        return self.samples_per_rank
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self) -> Iterator[int]:
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        shard_order = torch.randperm(len(self.dataset.shards), generator=generator).tolist()
+        indices: list[int] = []
+        start = 0
+        shard_starts: list[int] = []
+        for end in self.dataset.ends:
+            shard_starts.append(start)
+            start = end
+        for shard_index in shard_order:
+            shard_start = shard_starts[shard_index]
+            count = self.dataset.ends[shard_index] - shard_start
+            local_order = torch.randperm(count, generator=generator).tolist()
+            indices.extend(shard_start + local_index for local_index in local_order)
+
+        total_size = self.samples_per_rank * self.replicas
+        if len(indices) < total_size:
+            indices.extend(indices[: total_size - len(indices)])
+        rank_start = self.rank * self.samples_per_rank
+        return iter(indices[rank_start : rank_start + self.samples_per_rank])
 
 
 def collate_field_batch(

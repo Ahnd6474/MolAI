@@ -11,7 +11,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from molai.data import FieldShardDataset, collate_field_batch
+from molai.data import FieldShardDataset, ShardShuffleSampler, collate_field_batch
 from molai.models.bridge import VPSchedule
 from molai.models.cloud import MolecularFieldCloud
 from molai.models.condition import SmilesConditionEncoder
@@ -29,6 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--condition-dropout", type=float, default=0.15)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
@@ -52,11 +54,15 @@ def main() -> None:
             f"{expected_channels}; select the matching model config"
         )
     tokenizer = SmilesTokenizer.from_smiles(dataset.iter_smiles())
+    sampler = ShardShuffleSampler(dataset, seed=args.seed)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=sampler,
         collate_fn=partial(collate_field_batch, tokenizer=tokenizer),
+        num_workers=args.workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.workers > 0,
     )
 
     model_config = config["model"]
@@ -99,9 +105,10 @@ def main() -> None:
     )
     global_step = 0
     for epoch in range(args.epochs):
+        sampler.set_epoch(epoch)
         for batch in loader:
-            clean = batch["field"].to(device)
-            token_ids = batch["token_ids"].to(device)
+            clean = batch["field"].to(device, non_blocking=True)
+            token_ids = batch["token_ids"].to(device, non_blocking=True)
             transition = schedule.sample_training_batch(clean, cloud_samples)
             condition = condition_encoder(token_ids)
             keep = torch.rand(condition.shape[0], 1, device=device) >= args.condition_dropout
