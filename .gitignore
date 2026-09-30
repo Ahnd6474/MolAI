@@ -9,6 +9,7 @@ __pycache__/
 data/test.parquet
 data/train.parquet
 data/sample_submission.csv
+data/*-noise/
 artifacts/
 checkpoints/
 outputs/
@@ -19,4 +20,3 @@ submission.csv
 kaggle.json
 .idea/
 .vscode/
-
