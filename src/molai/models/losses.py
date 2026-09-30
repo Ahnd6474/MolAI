@@ -21,28 +21,50 @@ def full_band_distance(first: Tensor, second: Tensor, levels: int = 3) -> Tensor
 
     if first.shape != second.shape or first.ndim != 4:
         raise ValueError("distance inputs must share [B,C,H,W] shape")
-    error = first - second
-    distances = []
+    first_bands = _full_band_features(first, levels)
+    second_bands = _full_band_features(second, levels)
+    distances = [
+        torch.sqrt((left - right).square() + 1e-6).mean(dim=(1, 2, 3))
+        for left, right in zip(first_bands, second_bands, strict=True)
+    ]
+    return torch.stack(distances).mean(dim=0)
+
+
+def _full_band_features(images: Tensor, levels: int) -> tuple[Tensor, ...]:
+    """Compute a reusable undecimated band pyramid for an image batch."""
+
+    residual = images
+    bands = []
     for level in range(levels):
-        low = _atrous_blur(error, 2**level)
-        high = error - low
-        distances.append(torch.sqrt(high.square() + 1e-6).mean(dim=(1, 2, 3)))
-        error = low
-    distances.append(torch.sqrt(error.square() + 1e-6).mean(dim=(1, 2, 3)))
+        low = _atrous_blur(residual, 2**level)
+        bands.append(residual - low)
+        residual = low
+    return (*bands, residual)
+
+
+def _cloud_band_features(cloud: Tensor, levels: int) -> tuple[Tensor, ...]:
+    batch, samples = cloud.shape[:2]
+    bands = _full_band_features(cloud.flatten(0, 1), levels)
+    return tuple(band.reshape(batch, samples, *band.shape[1:]) for band in bands)
+
+
+def _pairwise_band_distance(
+    first: tuple[Tensor, ...], second: tuple[Tensor, ...]
+) -> Tensor:
+    distances = []
+    for left_band, right_band in zip(first, second, strict=True):
+        difference = left_band[:, :, None] - right_band[:, None]
+        distances.append(
+            torch.sqrt(difference.square() + 1e-6).mean(dim=(3, 4, 5))
+        )
     return torch.stack(distances).mean(dim=0)
 
 
 def _pairwise_cloud_distance(first: Tensor, second: Tensor, levels: int) -> Tensor:
-    batch, first_samples = first.shape[:2]
-    second_samples = second.shape[1]
-    left = first[:, :, None].expand(-1, -1, second_samples, -1, -1, -1)
-    right = second[:, None].expand(-1, first_samples, -1, -1, -1, -1)
-    flat_distance = full_band_distance(
-        left.reshape(-1, *first.shape[2:]),
-        right.reshape(-1, *second.shape[2:]),
-        levels,
+    return _pairwise_band_distance(
+        _cloud_band_features(first, levels),
+        _cloud_band_features(second, levels),
     )
-    return flat_distance.reshape(batch, first_samples, second_samples)
 
 
 class FullBandEnergyDistance(nn.Module):
@@ -58,16 +80,12 @@ class FullBandEnergyDistance(nn.Module):
             raise ValueError("clouds must have shape [B,M,C,H,W]")
         predicted_correction = predicted - current[:, None]
         target_correction = target - current[:, None]
-        cross = _pairwise_cloud_distance(
-            predicted_correction, target_correction, self.levels
-        ).mean()
-        within_predicted = _pairwise_cloud_distance(
-            predicted_correction, predicted_correction, self.levels
-        ).mean()
+        predicted_bands = _cloud_band_features(predicted_correction, self.levels)
+        target_bands = _cloud_band_features(target_correction, self.levels)
+        cross = _pairwise_band_distance(predicted_bands, target_bands).mean()
+        within_predicted = _pairwise_band_distance(predicted_bands, predicted_bands).mean()
         loss = 2.0 * cross - within_predicted
         if self.include_target_constant:
-            within_target = _pairwise_cloud_distance(
-                target_correction, target_correction, self.levels
-            ).mean()
+            within_target = _pairwise_band_distance(target_bands, target_bands).mean()
             loss = loss - within_target
         return loss

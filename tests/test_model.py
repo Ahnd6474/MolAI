@@ -4,7 +4,7 @@ from molai.models.bridge import VPSchedule
 from molai.models.cloud import MolecularCloudModel, MolecularFieldCloud
 from molai.models.condition import SpectrumConditionEncoder
 from molai.models.image_smiles import FieldToSmiles
-from molai.models.losses import FullBandEnergyDistance
+from molai.models.losses import FullBandEnergyDistance, full_band_distance
 from molai.models.smiles import SmilesTokenizer
 
 
@@ -46,6 +46,28 @@ def test_bridge_and_energy_distance() -> None:
     assert bridge.current.shape == clean.shape
     assert bridge.target_cloud.shape == (2, 3, 1, 16, 16)
     assert abs(float(loss)) < 1e-5
+
+
+def test_reused_band_pyramid_matches_direct_error_filtering() -> None:
+    torch.manual_seed(4)
+    first = torch.randn(3, 1, 16, 16)
+    second = torch.randn(3, 1, 16, 16)
+    error = first - second
+    direct_distances = []
+    kernel_1d = first.new_tensor([1.0, 4.0, 6.0, 4.0, 1.0]) / 16.0
+    kernel = torch.outer(kernel_1d, kernel_1d)[None, None]
+    for level in range(3):
+        low = torch.nn.functional.conv2d(
+            error, kernel, padding=2 * 2**level, dilation=2**level
+        )
+        direct_distances.append(
+            torch.sqrt((error - low).square() + 1e-6).mean(dim=(1, 2, 3))
+        )
+        error = low
+    direct_distances.append(torch.sqrt(error.square() + 1e-6).mean(dim=(1, 2, 3)))
+    expected = torch.stack(direct_distances).mean(dim=0)
+
+    torch.testing.assert_close(full_band_distance(first, second, levels=3), expected)
 
 
 def test_noise_token_cloud_is_deterministic_and_sample_independent() -> None:
