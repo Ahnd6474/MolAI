@@ -9,10 +9,10 @@ import json
 import multiprocessing
 import os
 import time
+from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
-from typing import Callable, Iterable
 
 import torch
 from rdkit import RDLogger
