@@ -358,7 +358,8 @@ uv run python scripts/prepare_noise_dataset.py \
 
 Pack every MS/MS replicate and every valid peak into CSR shards aligned with
 the field records. There is no per-molecule spectrum cap and no top-k peak
-selection; 64 is only the bounded attention compute chunk size:
+selection; 256 is only the bounded sparse-convolution compute chunk size. Two
+indexwise max-pool stages reduce each chunk to 64 tokens before attention:
 
 ```bash
 uv run python scripts/prepare_spectrum_field_dataset.py \

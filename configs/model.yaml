@@ -30,18 +30,20 @@ training:
   min_learning_rate: 0.00001
   validation_fraction: 0.02
   condition_dropout: 0.15
-  peak_chunk_size: 64
+  peak_chunk_size: 256
   log_every: 1
 
 spectrum_encoder:
   heads: 8
-  peak_layers: 3
+  peak_conv_stages: 2
+  peak_conv_kernel_size: 5
+  peak_tau_min: 0.005
+  peak_tau_max: 2.0
+  peak_cutoff_multiplier: 8.0
   spectrum_layers: 2
-  relative_bands: 16
-  relative_mass_max: 256.0
   ffn_ratio: 2.0
   dropout: 0.1
   peak_position_dim: 32
   mz_bin_width: 0.01
   mz_upper_bound: 5000.0
-  peak_chunk_batch: 1024
+  peak_chunk_batch: 256

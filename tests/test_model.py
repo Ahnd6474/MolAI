@@ -2,7 +2,11 @@ import torch
 
 from molai.models.bridge import GeometricVESchedule, VPSchedule
 from molai.models.cloud import MolecularCloudModel, MolecularFieldCloud
-from molai.models.condition import PositionwiseAffinePeakEmbedding, SpectrumConditionEncoder
+from molai.models.condition import (
+    ExponentialDistanceConvBlock,
+    PositionwiseAffinePeakEmbedding,
+    SpectrumConditionEncoder,
+)
 from molai.models.image_smiles import FieldToSmiles
 from molai.models.losses import FullBandEnergyDistance, full_band_distance
 from molai.models.smiles import SmilesTokenizer
@@ -150,7 +154,7 @@ def test_spectrum_condition_attention_shapes_and_backward() -> None:
         metadata_dim=5,
         dim=32,
         heads=4,
-        peak_layers=2,
+        peak_conv_stages=2,
         spectrum_layers=1,
         dropout=0.0,
         peak_position_dim=8,
@@ -164,7 +168,7 @@ def test_spectrum_condition_attention_shapes_and_backward() -> None:
     assert torch.isfinite(condition).all()
     condition.square().mean().backward()
     assert encoder.peak_embedding.slope.weight.grad is not None
-    assert encoder.peak_blocks[0].attention.relative_projection.weight.grad is not None
+    assert encoder.peak_conv_blocks[0].raw_tau.grad is not None
 
 
 def test_spectrum_condition_attention_supports_bfloat16_autocast() -> None:
@@ -172,7 +176,7 @@ def test_spectrum_condition_attention_supports_bfloat16_autocast() -> None:
         metadata_dim=5,
         dim=32,
         heads=4,
-        peak_layers=1,
+        peak_conv_stages=1,
         spectrum_layers=1,
         dropout=0.0,
         peak_position_dim=8,
@@ -204,12 +208,31 @@ def test_peak_embedding_is_affine_in_raw_intensity() -> None:
     assert embedding.position_indices(torch.tensor([100.0, 100.01])).tolist() == [10000, 10001]
 
 
+def test_distance_convolution_treats_far_index_neighbor_as_zero() -> None:
+    torch.manual_seed(23)
+    block = ExponentialDistanceConvBlock(
+        dim=8,
+        heads=2,
+        kernel_size=3,
+        tau_min=0.01,
+        tau_max=0.02,
+        cutoff_multiplier=4.0,
+        dropout=0.0,
+    ).eval()
+    tokens = torch.randn(1, 2, 8)
+    masses = torch.tensor([[100.0, 200.0]])
+    both = block(tokens, masses, masses, torch.tensor([[True, True]]))
+    isolated = block(tokens, masses, masses, torch.tensor([[True, False]]))
+
+    torch.testing.assert_close(both[:, 0], isolated[:, 0])
+
+
 def test_spectrum_condition_attention_is_set_invariant() -> None:
     encoder = SpectrumConditionEncoder(
         metadata_dim=5,
         dim=32,
         heads=4,
-        peak_layers=2,
+        peak_conv_stages=2,
         spectrum_layers=2,
         dropout=0.0,
         peak_position_dim=8,
@@ -245,7 +268,7 @@ def test_spectrum_condition_attention_uses_all_peak_chunks() -> None:
         metadata_dim=2,
         dim=16,
         heads=4,
-        peak_layers=1,
+        peak_conv_stages=1,
         spectrum_layers=1,
         dropout=0.0,
         peak_position_dim=8,

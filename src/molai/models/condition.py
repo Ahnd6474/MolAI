@@ -82,85 +82,43 @@ class PositionwiseAffinePeakEmbedding(nn.Module):
         return slope * intensity.unsqueeze(-1) + intercept
 
 
-class RelativeMassSelfAttention(nn.Module):
-    """Self-attention with a learned per-head bias for absolute peak mass gaps."""
+class ExponentialDistanceConvBlock(nn.Module):
+    """Indexwise convolution gated by compact exponential m/z distance kernels."""
 
     def __init__(
         self,
         dim: int,
         heads: int,
-        relative_bands: int = 16,
-        relative_bins: int = 512,
-        relative_mass_max: float = 256.0,
-        dropout: float = 0.0,
+        kernel_size: int = 5,
+        tau_min: float = 0.005,
+        tau_max: float = 2.0,
+        cutoff_multiplier: float = 8.0,
+        ffn_ratio: float = 2.0,
+        dropout: float = 0.1,
     ) -> None:
         super().__init__()
         if dim % heads:
-            raise ValueError("attention dim must be divisible by heads")
-        if relative_bands < 2 or relative_bins < 2 or relative_mass_max <= 0.0:
-            raise ValueError("relative mass configuration must be positive")
+            raise ValueError("convolution dim must be divisible by heads")
+        if kernel_size < 1 or kernel_size % 2 != 1:
+            raise ValueError("kernel_size must be a positive odd number")
+        if not 0.0 < tau_min <= tau_max or cutoff_multiplier <= 0.0:
+            raise ValueError("exponential distance scales must be positive")
         self.heads = heads
         self.head_dim = dim // heads
-        self.relative_mass_max = relative_mass_max
-        self.relative_bins = relative_bins
-        self.qkv = nn.Linear(dim, dim * 3)
+        self.kernel_size = kernel_size
+        self.radius = kernel_size // 2
+        self.cutoff_multiplier = cutoff_multiplier
+        initial_tau = torch.logspace(
+            math.log10(tau_min), math.log10(tau_max), heads
+        )
+        self.raw_tau = nn.Parameter(torch.log(torch.expm1(initial_tau)))
+        self.offset_weight = nn.Parameter(torch.full((kernel_size, heads), 1.0 / kernel_size))
+        self.norm = nn.LayerNorm(dim)
+        self.value = nn.Linear(dim, dim, bias=False)
         self.output = nn.Linear(dim, dim)
-        self.dropout = nn.Dropout(dropout)
-        self.relative_projection = nn.Linear(relative_bands, heads, bias=False)
-        centers = torch.linspace(0.0, 1.0, relative_bands)
-        positions = torch.linspace(0.0, 1.0, relative_bins)
-        width = 1.0 / (relative_bands - 1)
-        relative_basis = torch.exp(
-            -0.5 * ((positions[:, None] - centers[None]) / width).square()
-        )
-        self.register_buffer("relative_basis", relative_basis, persistent=False)
-
-    def _relative_bias(self, masses: Tensor) -> Tensor:
-        difference = (masses.unsqueeze(-1) - masses.unsqueeze(-2)).abs()
-        normalized = difference.clamp_max(self.relative_mass_max) / self.relative_mass_max
-        buckets = (normalized * (self.relative_bins - 1)).round().long()
-        bias_table = self.relative_projection(self.relative_basis)
-        return bias_table[buckets].permute(0, 3, 1, 2)
-
-    def forward(self, tokens: Tensor, masses: Tensor, mask: Tensor) -> Tensor:
-        batch, length, dim = tokens.shape
-        qkv = self.qkv(tokens).reshape(batch, length, 3, self.heads, self.head_dim)
-        query, key, value = qkv.unbind(dim=2)
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
-        scores = torch.matmul(query.float(), key.float().transpose(-2, -1))
-        scores = scores / math.sqrt(self.head_dim)
-        scores = scores + self._relative_bias(masses).float()
-        scores = scores.masked_fill(~mask[:, None, None, :], -torch.inf)
-        weights = self.dropout(scores.softmax(dim=-1)).to(value.dtype)
-        attended = torch.matmul(weights, value).transpose(1, 2).reshape(batch, length, dim)
-        attended = attended.masked_fill(~mask.unsqueeze(-1), 0.0)
-        return self.output(attended)
-
-
-class RelativeMassTransformerBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        heads: int,
-        relative_bands: int,
-        relative_mass_max: float,
-        ffn_ratio: float,
-        dropout: float,
-    ) -> None:
-        super().__init__()
         hidden = int(dim * ffn_ratio)
-        self.attention_norm = nn.LayerNorm(dim)
-        self.attention = RelativeMassSelfAttention(
-            dim,
-            heads,
-            relative_bands=relative_bands,
-            relative_mass_max=relative_mass_max,
-            dropout=dropout,
-        )
-        self.ffn_norm = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
+            nn.LayerNorm(dim),
             nn.Linear(dim, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -168,10 +126,78 @@ class RelativeMassTransformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, tokens: Tensor, masses: Tensor, mask: Tensor) -> Tensor:
-        tokens = tokens + self.attention(self.attention_norm(tokens), masses, mask)
-        tokens = tokens + self.ffn(self.ffn_norm(tokens))
+    def _distance_gate(self, distance: Tensor) -> Tensor:
+        tau = F.softplus(self.raw_tau.float()).clamp_min(1e-5)
+        cutoff = self.cutoff_multiplier * tau
+        baseline = math.exp(-self.cutoff_multiplier)
+        decay = (torch.exp(-distance[..., None].float() / tau) - baseline) / (
+            1.0 - baseline
+        )
+        return decay.clamp_min(0.0) * (distance[..., None] < cutoff)
+
+    def forward(
+        self,
+        tokens: Tensor,
+        lower_mz: Tensor,
+        upper_mz: Tensor,
+        mask: Tensor,
+    ) -> Tensor:
+        if tokens.ndim != 3 or lower_mz.shape != tokens.shape[:2]:
+            raise ValueError("distance convolution expects [B,L,D] tokens and [B,L] masses")
+        if upper_mz.shape != lower_mz.shape or mask.shape != lower_mz.shape:
+            raise ValueError("mass intervals and mask must have shape [B,L]")
+        batch, length, dim = tokens.shape
+        normalized = self.norm(tokens)
+        values = self.value(normalized).reshape(batch, length, self.heads, self.head_dim)
+        padded_values = F.pad(values, (0, 0, 0, 0, self.radius, self.radius))
+        neighbors = padded_values.unfold(1, self.kernel_size, 1)
+        neighbors = neighbors.permute(0, 1, 4, 2, 3)
+
+        padded_lower = F.pad(lower_mz, (self.radius, self.radius))
+        padded_upper = F.pad(upper_mz, (self.radius, self.radius))
+        neighbor_lower = padded_lower.unfold(1, self.kernel_size, 1)
+        neighbor_upper = padded_upper.unfold(1, self.kernel_size, 1)
+        left_gap = lower_mz[:, :, None] - neighbor_upper
+        right_gap = neighbor_lower - upper_mz[:, :, None]
+        distance = torch.maximum(left_gap, right_gap).clamp_min(0.0)
+
+        padded_mask = F.pad(mask, (self.radius, self.radius), value=False)
+        neighbor_mask = padded_mask.unfold(1, self.kernel_size, 1)
+        gate = self._distance_gate(distance)
+        gate = gate * neighbor_mask[..., None] * mask[:, :, None, None]
+        gate = gate * self.offset_weight[None, None]
+        mixed = (neighbors.float() * gate[..., None]).sum(dim=2)
+        mixed = mixed.to(tokens.dtype).reshape(batch, length, dim)
+        tokens = tokens + self.output(mixed)
+        tokens = tokens + self.ffn(tokens)
         return tokens.masked_fill(~mask.unsqueeze(-1), 0.0)
+
+
+def indexwise_max_pool(
+    tokens: Tensor,
+    lower_mz: Tensor,
+    upper_mz: Tensor,
+    mask: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Halve sorted sparse sequences without materializing absent m/z positions."""
+
+    if tokens.shape[1] % 2:
+        tokens = F.pad(tokens, (0, 0, 0, 1))
+        lower_mz = F.pad(lower_mz, (0, 1), value=torch.inf)
+        upper_mz = F.pad(upper_mz, (0, 1), value=-torch.inf)
+        mask = F.pad(mask, (0, 1), value=False)
+    batch, length, dim = tokens.shape
+    pair_mask = mask.reshape(batch, length // 2, 2)
+    pooled_mask = pair_mask.any(dim=-1)
+    grouped = tokens.masked_fill(~mask.unsqueeze(-1), -torch.inf)
+    grouped = grouped.reshape(batch, length // 2, 2, dim)
+    pooled = grouped.amax(dim=2)
+    pooled = torch.where(pooled_mask.unsqueeze(-1), pooled, 0.0)
+    pooled_lower = lower_mz.reshape(batch, length // 2, 2).amin(dim=2)
+    pooled_upper = upper_mz.reshape(batch, length // 2, 2).amax(dim=2)
+    pooled_lower = torch.where(pooled_mask, pooled_lower, 0.0)
+    pooled_upper = torch.where(pooled_mask, pooled_upper, 0.0)
+    return pooled, pooled_lower, pooled_upper, pooled_mask
 
 
 class SegmentAttentionPool(nn.Module):
@@ -232,17 +258,19 @@ class SetFeedForwardBlock(nn.Module):
 
 
 class SpectrumConditionEncoder(nn.Module):
-    """Hierarchical attention encoder for sparse peaks and replicate spectra."""
+    """Distance-aware sparse CNN followed by compressed spectrum attention."""
 
     def __init__(
         self,
         metadata_dim: int,
         dim: int = 384,
         heads: int = 8,
-        peak_layers: int = 3,
+        peak_conv_stages: int = 2,
+        peak_conv_kernel_size: int = 5,
+        peak_tau_min: float = 0.005,
+        peak_tau_max: float = 2.0,
+        peak_cutoff_multiplier: float = 8.0,
         spectrum_layers: int = 2,
-        relative_bands: int = 16,
-        relative_mass_max: float = 256.0,
         ffn_ratio: float = 2.0,
         dropout: float = 0.1,
         peak_position_dim: int = 32,
@@ -258,6 +286,8 @@ class SpectrumConditionEncoder(nn.Module):
             raise ValueError("peak_chunk_size must be positive")
         if peak_chunk_batch < 1:
             raise ValueError("peak_chunk_batch must be positive")
+        if peak_conv_stages not in {1, 2}:
+            raise ValueError("peak_conv_stages must be one or two")
         self.peak_chunk_size = peak_chunk_size
         self.peak_chunk_batch = peak_chunk_batch
         self.mz_upper_bound = mz_upper_bound
@@ -277,21 +307,22 @@ class SpectrumConditionEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
-        self.spectrum_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        self.peak_blocks = nn.ModuleList(
+        self.peak_conv_blocks = nn.ModuleList(
             [
-                RelativeMassTransformerBlock(
+                ExponentialDistanceConvBlock(
                     dim,
                     heads,
-                    relative_bands,
-                    relative_mass_max,
-                    ffn_ratio,
-                    dropout,
+                    kernel_size=peak_conv_kernel_size,
+                    tau_min=peak_tau_min * (4**stage),
+                    tau_max=peak_tau_max * (4**stage),
+                    cutoff_multiplier=peak_cutoff_multiplier,
+                    ffn_ratio=ffn_ratio,
+                    dropout=dropout,
                 )
-                for _ in range(peak_layers)
+                for stage in range(peak_conv_stages)
             ]
         )
-        self.chunk_pool = SegmentAttentionPool(dim, heads)
+        self.peak_attention = SegmentAttentionPool(dim, heads)
         self.spectrum_blocks = nn.ModuleList(
             [SetFeedForwardBlock(dim, ffn_ratio, dropout) for _ in range(spectrum_layers)]
         )
@@ -406,7 +437,8 @@ class SpectrumConditionEncoder(nn.Module):
         metadata_tokens = metadata_tokens + self.precursor_embedding(
             precursor_feature.unsqueeze(-1)
         )
-        chunk_embedding_parts: list[Tensor] = []
+        compressed_parts: list[Tensor] = []
+        compressed_segment_parts: list[Tensor] = []
         for start in range(0, len(peak_chunks), self.peak_chunk_batch):
             end = min(start + self.peak_chunk_batch, len(peak_chunks))
             chunk_slice = peak_chunks[start:end]
@@ -418,29 +450,26 @@ class SpectrumConditionEncoder(nn.Module):
             intensity = torch.nan_to_num(
                 chunk_slice[..., 1], nan=0.0, posinf=1.0, neginf=0.0
             )
-            chunk_precursor = precursor_mz[mapping_slice]
             chunk_metadata = metadata_tokens[mapping_slice]
-            peak_tokens = self.peak_embedding(mz, intensity)
-            peak_tokens = peak_tokens + chunk_metadata[:, None]
-            chunk_tokens = self.spectrum_token.expand(end - start, -1, -1)
-            chunk_tokens = chunk_tokens + chunk_metadata[:, None]
-            tokens = torch.cat((chunk_tokens, peak_tokens), dim=1)
-            token_mask = torch.cat(
-                (
-                    torch.ones(
-                        end - start, 1, dtype=torch.bool, device=peak_chunks.device
-                    ),
-                    mask_slice,
-                ),
-                dim=1,
-            )
-            masses = torch.cat((chunk_precursor[:, None], mz), dim=1)
-            for block in self.peak_blocks:
-                tokens = block(tokens, masses, token_mask)
-            chunk_embedding_parts.append(tokens[:, 0])
-        chunk_embeddings = torch.cat(chunk_embedding_parts)
-        spectrum_embeddings = self.chunk_pool(
-            chunk_embeddings, chunk_to_spectrum, spectrum_count
+            tokens = self.peak_embedding(mz, intensity) + chunk_metadata[:, None]
+            lower_mz = mz
+            upper_mz = mz
+            token_mask = mask_slice
+            for block in self.peak_conv_blocks:
+                tokens = block(tokens, lower_mz, upper_mz, token_mask)
+                tokens, lower_mz, upper_mz, token_mask = indexwise_max_pool(
+                    tokens, lower_mz, upper_mz, token_mask
+                )
+            valid_tokens = tokens[token_mask]
+            token_segments = mapping_slice[:, None].expand(-1, tokens.shape[1])[
+                token_mask
+            ]
+            compressed_parts.append(valid_tokens)
+            compressed_segment_parts.append(token_segments)
+        compressed_tokens = torch.cat(compressed_parts)
+        compressed_segments = torch.cat(compressed_segment_parts)
+        spectrum_embeddings = self.peak_attention(
+            compressed_tokens, compressed_segments, spectrum_count
         )
         spectrum_embeddings = spectrum_embeddings + metadata_tokens
         for block in self.spectrum_blocks:
