@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shutil
+import time
 from functools import partial
 from pathlib import Path
 
@@ -465,7 +466,9 @@ def main() -> None:
         condition_runner.train()
         train_total = 0.0
         train_count = 0
+        batch_end = time.perf_counter()
         for batch in train_loader:
+            batch_start = batch_end
             if args.max_steps is not None and global_step >= args.max_steps:
                 stop = True
                 break
@@ -497,6 +500,8 @@ def main() -> None:
             scheduler.step()
             global_step += 1
             loss_value = float(loss.detach())
+            batch_seconds = time.perf_counter() - batch_start
+            batch_end = time.perf_counter()
             train_total += loss_value * clean.shape[0]
             train_count += clean.shape[0]
             if rank == 0 and global_step % log_every == 0:
@@ -506,10 +511,21 @@ def main() -> None:
                 writer.add_scalar(
                     "batch/learning_rate", optimizer.param_groups[0]["lr"], global_step
                 )
+                writer.add_scalar("batch/seconds", batch_seconds, global_step)
+                writer.add_scalar(
+                    "batch/molecules_per_second",
+                    clean.shape[0] * world_size / batch_seconds,
+                    global_step,
+                )
                 peak_memory = None
+                peak_reserved = None
                 if device.type == "cuda":
                     peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
+                    peak_reserved = torch.cuda.max_memory_reserved(device) / 2**30
                     writer.add_scalar("batch/gpu_peak_memory_gib", peak_memory, global_step)
+                    writer.add_scalar(
+                        "batch/gpu_peak_reserved_gib", peak_reserved, global_step
+                    )
                 if "spectrum_to_molecule" in batch:
                     writer.add_scalar(
                         "batch/spectra",
@@ -530,7 +546,12 @@ def main() -> None:
                     f"epoch={epoch + 1}/{epochs} step={global_step} "
                     f"loss={loss_value:.5f} grad={float(grad_norm):.4f} "
                     f"lr={optimizer.param_groups[0]['lr']:.7f}"
-                    + (f" peak_mem={peak_memory:.2f}GiB" if peak_memory is not None else ""),
+                    + (
+                        f" speed={clean.shape[0] * world_size / batch_seconds:.1f}mol/s"
+                        f" peak_mem={peak_memory:.2f}/{peak_reserved:.2f}GiB"
+                        if peak_memory is not None and peak_reserved is not None
+                        else ""
+                    ),
                     flush=True,
                 )
 
