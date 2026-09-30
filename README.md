@@ -116,11 +116,19 @@ thread pool, rasterizes full batches on the selected Torch device, and writes re
 float16 shards. The default target is the electrostatic potential `G * Q` channel with
 shape `[molecules, 1, resolution, resolution]`; the bounded `field` and raw
 `signed_charge` remain selectable with `--channel`. Raw tensors never contain a color map;
-a small number of `coolwarm` PNGs is written separately for visual validation.
+a small number of `coolwarm` PNGs is written separately for visual validation. These
+validation PNGs show only the generated field—atom-position dots or `x` markers are not
+overlaid—so the preview cannot be mistaken for information stored in the training tensor.
 The default 128×128 renderer preserves full hydrogen influence. It first uses the original
 deterministic layout, counts only proper bond crossings, and generates alternative layouts
 only when at least one crossing is present. A replacement is accepted only if it reduces
 that count, so crossing-free molecules retain their original coordinates and information.
+
+Here, `Q = rho_nuclei - rho_electrons` is a charge-conserving 2D valence-charge density.
+`G * Q` is its linear, zero-padded FFT convolution with the softened kernel
+`G(r) = 1 / sqrt(r^2 + epsilon^2)`, followed by subtraction of the per-image mean to fix
+the arbitrary potential offset. It is a deterministic 2D electrostatic-potential surrogate,
+not a 3D ab-initio molecular electrostatic potential.
 
 ```powershell
 uv run python scripts/generate_expected_charge_dataset.py `
@@ -140,6 +148,18 @@ InChIKeys are retained in a sidecar index so duplicates can be skipped without h
 full input table in memory. For an upstream source that is already guaranteed unique, use
 `--no-deduplicate` to avoid keeping that index in RAM when processing tens of millions of
 records.
+
+The large-scale path uses buffered streaming input, direct Arrow-column extraction for
+Parquet, and token-level decoding for SMILES text. On CUDA, CPU/RDKit preparation of the
+next batch overlaps the current GPU render; pinned-memory non-blocking copies move finished
+tensors back to the host. Shard serialization runs in one bounded background writer with a
+16 MiB file buffer, so computation can overlap the previous `torch.save` without allowing
+unbounded queued data. A shard and its deduplication keys are completed before its manifest
+transaction is committed, preserving safe resume behavior after interruption.
+
+The complete image-generation definition, channel semantics, shard schema, performance
+choices, and validation procedure are documented in
+[`scripts/IMAGE_GENERATION.md`](scripts/IMAGE_GENERATION.md).
 
 Generation is resumable: rerunning with the same source and solver configuration continues
 from the recorded offset. A different source or configuration is rejected to prevent
@@ -184,8 +204,12 @@ MolAI/
 ├── scripts/
 │   ├── check_environment.py  # CUDA, RDKit, and competition-schema checks
 │   ├── generate_dft_dataset.py
-│   ├── preview_*.py          # Field and diagnostic visualizations
+│   ├── generate_expected_charge_dataset.py # Optimized 128x128 single-channel shards
+│   ├── generate_expected_charge_samples.py # 2x4 diagnostic figures
+│   ├── preview_layout_variants.py           # Layout/H-influence comparisons
+│   ├── preview_*.py          # Other field and diagnostic visualizations
 │   ├── evaluate_electron_cloud.py
+│   ├── IMAGE_GENERATION.md   # Expected-charge generation and I/O specification
 │   └── train_cloud.py        # Structure-conditioned field pretraining entry point
 ├── src/molai/
 │   ├── dft/                  # Layout, orbital-free, Kohn-Sham, and shard writer code
@@ -254,6 +278,21 @@ The submitted file must be named `submission.csv`. Each test `molecule_id` appea
 with up to 25 ranked SMILES joined by semicolons.
 
 ## Experiments
+
+### Generate expected-charge diagnostic images
+
+Create the eight-panel diagnostic view for selected molecules:
+
+```powershell
+uv run python scripts/generate_expected_charge_samples.py `
+  --sample caffeine="CN1C=NC2=C1C(=O)N(C(=O)N2C)C" `
+  --resolution 128 `
+  --device cpu
+```
+
+For pretraining, use `generate_expected_charge_dataset.py` instead. It renders only the
+selected single channel, defaults to 128×128 float16 output, omits coordinate markers from
+validation previews, and supports resumable sharding and GPU/CPU pipeline overlap.
 
 ### Preview the graph-derived electron cloud
 
