@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--condition-dropout", type=float, default=0.15)
     parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
@@ -58,9 +58,10 @@ def main() -> None:
         dist.init_process_group(backend="nccl", device_id=device)
     else:
         device = torch.device(args.device)
-    torch.manual_seed(args.seed + rank)
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     dataset = open_field_dataset(args.data)
+    training_seed = args.seed if args.seed is not None else int(dataset.manifest.get("seed", 0))
+    torch.manual_seed(training_seed + rank)
     expected_channels = int(config["model"]["field_channels"])
     actual_channels = len(dataset.manifest.get("field_channels", ["signed_charge"]))
     if actual_channels != expected_channels:
@@ -78,13 +79,14 @@ def main() -> None:
     if vocabulary is None:
         raise RuntimeError("tokenizer vocabulary was not initialized")
     tokenizer = SmilesTokenizer(vocabulary)
+    batch_size = args.batch_size or int(config["cloud_matching"].get("batch_size_per_gpu", 1))
     sampler = ShardShuffleSampler(
         dataset,
-        seed=args.seed,
+        seed=training_seed,
         rank=rank,
         replicas=world_size,
+        batch_size=batch_size,
     )
-    batch_size = args.batch_size or int(config["cloud_matching"].get("batch_size_per_gpu", 1))
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -167,7 +169,14 @@ def main() -> None:
             token_ids = batch["token_ids"].to(device, non_blocking=True)
             noise_levels = batch.get("noise_level")
             if noise_levels is None:
-                transition = schedule.sample_training_batch(clean, cloud_samples)
+                transition = schedule.sample_training_batch(
+                    clean,
+                    cloud_samples,
+                    answer_jump=int(config["cloud_matching"].get("answer_jump", 8)),
+                    clean_answer_probability=float(
+                        config["cloud_matching"].get("clean_answer_probability", 0.25)
+                    ),
+                )
             else:
                 transition = schedule.sample_training_batch(
                     clean,

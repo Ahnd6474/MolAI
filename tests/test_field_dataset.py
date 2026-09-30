@@ -105,4 +105,31 @@ def test_noise_view_preserves_raw_fields_without_copying(tmp_path) -> None:
     item = dataset[0]
 
     torch.testing.assert_close(item["field"], torch.tensor([[[-4.0, 0.0], [4.0, 12.0]]]))
-    assert item["noise_level"] in range(1, 65)
+    assert "noise_level" not in item
+
+
+def test_shard_sampler_pads_each_rank_to_full_batches(tmp_path) -> None:
+    records = 17
+    torch.save(
+        {
+            "field": torch.zeros(records, 1, 2, 2),
+            "smiles": ["C"] * records,
+            "inchikey14": ["ABCDEFGHIJKLMN"] * records,
+            "electron_count": torch.ones(records),
+            "formal_charge": torch.zeros(records),
+        },
+        tmp_path / "fields-000000.pt",
+    )
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"shards": [{"file": "fields-000000.pt", "records": records}]}),
+        encoding="utf-8",
+    )
+    dataset = FieldShardDataset(tmp_path)
+    rank_zero = ShardShuffleSampler(dataset, replicas=2, rank=0, batch_size=4)
+    rank_one = ShardShuffleSampler(dataset, replicas=2, rank=1, batch_size=4)
+
+    combined = list(rank_zero) + list(rank_one)
+
+    assert len(rank_zero) == len(rank_one) == 12
+    assert set(combined) == set(range(records))
+    assert len(combined) - len(set(combined)) == 7

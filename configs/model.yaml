@@ -19,5 +19,7 @@ model:
 cloud_matching:
   batch_size_per_gpu: 16
   samples: 4
+  answer_jump: 8
+  clean_answer_probability: 0.25
   loss: energy_full_band
   full_band_levels: 3

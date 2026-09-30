@@ -87,7 +87,6 @@ class NoisyFieldDataset(Dataset[dict[str, object]]):
         self.source = FieldShardDataset(source_path, cache_shards=cache_shards)
         self.variants = int(self.manifest.get("variants_per_field", 1))
         self.levels = int(self.manifest["noise_schedule"]["levels"])
-        self.seed = int(self.manifest.get("seed", 0))
         if self.variants < 1 or self.levels < 2:
             raise ValueError("noise variants must be positive and levels must be at least two")
         self.shards = [
@@ -108,15 +107,8 @@ class NoisyFieldDataset(Dataset[dict[str, object]]):
             index += len(self)
         if not 0 <= index < len(self):
             raise IndexError(index)
-        source_index, variant = divmod(index, self.variants)
-        item = dict(self.source[source_index])
-        mixed = (
-            (source_index + 1) * 0x9E3779B185EBCA87
-            + (variant + 1) * 0xC2B2AE3D27D4EB4F
-            + self.seed
-        ) & ((1 << 64) - 1)
-        item["noise_level"] = 1 + mixed % self.levels
-        return item
+        source_index, _ = divmod(index, self.variants)
+        return dict(self.source[source_index])
 
     def iter_smiles(self) -> Iterator[str]:
         return self.source.iter_smiles()
@@ -142,6 +134,7 @@ class ShardShuffleSampler(Sampler[int]):
         seed: int = 0,
         rank: int = 0,
         replicas: int = 1,
+        batch_size: int | None = None,
     ) -> None:
         if replicas < 1 or not 0 <= rank < replicas:
             raise ValueError("rank must be in [0, replicas)")
@@ -151,6 +144,12 @@ class ShardShuffleSampler(Sampler[int]):
         self.replicas = replicas
         self.epoch = 0
         self.samples_per_rank = (len(dataset) + replicas - 1) // replicas
+        if batch_size is not None:
+            if batch_size < 1:
+                raise ValueError("batch_size must be positive")
+            self.samples_per_rank = (
+                (self.samples_per_rank + batch_size - 1) // batch_size * batch_size
+            )
 
     def __len__(self) -> int:
         return self.samples_per_rank
