@@ -352,6 +352,13 @@ uv run python scripts/train_cloud.py `
   --config configs/model_ks.yaml
 ```
 
+On a dual-GPU host, launch one process per GPU; `--batch-size` is per GPU:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=2 scripts/train_cloud.py \
+  --data data/expected-charge-128 --config configs/model.yaml --batch-size 8
+```
+
 ### Preview Kohn-Sham diagnostics
 
 ```powershell
