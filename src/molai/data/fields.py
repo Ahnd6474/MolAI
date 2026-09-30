@@ -27,6 +27,7 @@ class FieldShardDataset(Dataset[dict[str, object]]):
             self.ends.append(total)
         self.cache_shards = cache_shards
         self.cache: OrderedDict[int, dict[str, object]] = OrderedDict()
+        self.field_key = str(self.manifest.get("channel", "field"))
 
     def __len__(self) -> int:
         return self.ends[-1] if self.ends else 0
@@ -52,17 +53,24 @@ class FieldShardDataset(Dataset[dict[str, object]]):
         start = 0 if shard_index == 0 else self.ends[shard_index - 1]
         local_index = index - start
         payload = self._load_shard(shard_index)
+        field_key = self.field_key if self.field_key in payload else "field"
+        smiles_key = "canonical_smiles" if "canonical_smiles" in payload else "smiles"
+        key_name = "molecule_key" if "molecule_key" in payload else "inchikey14"
+        molecule_key = str(payload[key_name][local_index])
         return {
-            "field": payload["field"][local_index].float(),
-            "smiles": payload["smiles"][local_index],
-            "inchikey14": payload["inchikey14"][local_index],
+            "field": payload[field_key][local_index].float(),
+            "smiles": payload[smiles_key][local_index],
+            "molecule_key": molecule_key,
+            "inchikey14": molecule_key[:14],
             "electron_count": payload["electron_count"][local_index],
             "formal_charge": payload["formal_charge"][local_index],
         }
 
     def iter_smiles(self) -> Iterator[str]:
         for shard_index in range(len(self.shards)):
-            yield from self._load_shard(shard_index)["smiles"]
+            payload = self._load_shard(shard_index)
+            key = "canonical_smiles" if "canonical_smiles" in payload else "smiles"
+            yield from payload[key]
 
 
 def collate_field_batch(
@@ -80,4 +88,3 @@ def collate_field_batch(
         "smiles": [str(item["smiles"]) for item in batch],
         "inchikey14": [str(item["inchikey14"]) for item in batch],
     }
-
