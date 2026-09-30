@@ -30,7 +30,7 @@ training:
   min_learning_rate: 0.00001
   validation_fraction: 0.02
   condition_dropout: 0.15
-  peak_chunk_size: 256
+  peak_chunk_size: 64
   log_every: 1
 
 spectrum_encoder:
@@ -43,4 +43,4 @@ spectrum_encoder:
   ffn_ratio: 2.0
   dropout: 0.1
   max_mz: 1500.0
-  peak_chunk_batch: 256
+  peak_chunk_batch: 1024
