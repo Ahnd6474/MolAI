@@ -470,6 +470,8 @@ def main() -> None:
                 stop = True
                 break
             clean = batch["field"].to(device, non_blocking=True)
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
             levels = batch.get("noise_level")
             current_levels = levels.to(device, non_blocking=True) if isinstance(levels, Tensor) else None
             transition = _sample_transition(
@@ -504,6 +506,10 @@ def main() -> None:
                 writer.add_scalar(
                     "batch/learning_rate", optimizer.param_groups[0]["lr"], global_step
                 )
+                peak_memory = None
+                if device.type == "cuda":
+                    peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
+                    writer.add_scalar("batch/gpu_peak_memory_gib", peak_memory, global_step)
                 if "spectrum_to_molecule" in batch:
                     writer.add_scalar(
                         "batch/spectra",
@@ -523,7 +529,8 @@ def main() -> None:
                 print(
                     f"epoch={epoch + 1}/{epochs} step={global_step} "
                     f"loss={loss_value:.5f} grad={float(grad_norm):.4f} "
-                    f"lr={optimizer.param_groups[0]['lr']:.7f}",
+                    f"lr={optimizer.param_groups[0]['lr']:.7f}"
+                    + (f" peak_mem={peak_memory:.2f}GiB" if peak_memory is not None else ""),
                     flush=True,
                 )
 
