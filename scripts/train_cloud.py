@@ -387,8 +387,8 @@ def main() -> None:
             relative_mass_max=float(spectrum_config["relative_mass_max"]),
             ffn_ratio=float(spectrum_config["ffn_ratio"]),
             dropout=float(spectrum_config["dropout"]),
-            max_mz=float(spectrum_config["max_mz"]),
-            max_peaks=peak_chunk_size,
+            mz_reference=float(spectrum_config["mz_reference"]),
+            peak_chunk_size=peak_chunk_size,
             peak_chunk_batch=int(spectrum_config.get("peak_chunk_batch", 256)),
         ).to(device)
         condition_module: nn.Module = RaggedSpectrumConditionRunner(condition_encoder)

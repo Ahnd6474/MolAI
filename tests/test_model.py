@@ -2,7 +2,7 @@ import torch
 
 from molai.models.bridge import GeometricVESchedule, VPSchedule
 from molai.models.cloud import MolecularCloudModel, MolecularFieldCloud
-from molai.models.condition import SpectrumConditionEncoder
+from molai.models.condition import AffinePeakEmbedding, SpectrumConditionEncoder
 from molai.models.image_smiles import FieldToSmiles
 from molai.models.losses import FullBandEnergyDistance, full_band_distance
 from molai.models.smiles import SmilesTokenizer
@@ -160,7 +160,7 @@ def test_spectrum_condition_attention_shapes_and_backward() -> None:
     assert condition.shape == (2, 32)
     assert torch.isfinite(condition).all()
     condition.square().mean().backward()
-    assert encoder.peak_embedding.intensity_direction[0].weight.grad is not None
+    assert encoder.peak_embedding.coefficient_projection[0].weight.grad is not None
     assert encoder.peak_blocks[0].attention.relative_projection.weight.grad is not None
 
 
@@ -178,6 +178,18 @@ def test_spectrum_condition_attention_supports_bfloat16_autocast() -> None:
 
     assert condition.shape == (2, 32)
     assert torch.isfinite(condition).all()
+
+
+def test_peak_embedding_is_affine_in_raw_intensity() -> None:
+    embedding = AffinePeakEmbedding(dim=16, fourier_bands=4)
+    mz = torch.tensor([[100.0, 250.0, 900.0]])
+    zero = embedding(mz, torch.zeros_like(mz))
+    one = embedding(mz, torch.ones_like(mz))
+    two = embedding(mz, torch.full_like(mz, 2.0))
+
+    torch.testing.assert_close(two - zero, 2.0 * (one - zero))
+    _, intercept = embedding.coefficients(mz)
+    torch.testing.assert_close(zero, intercept)
 
 
 def test_spectrum_condition_attention_is_set_invariant() -> None:
@@ -221,7 +233,7 @@ def test_spectrum_condition_attention_uses_all_peak_chunks() -> None:
         peak_layers=1,
         spectrum_layers=1,
         dropout=0.0,
-        max_peaks=4,
+        peak_chunk_size=4,
     ).eval()
     peaks = torch.tensor(
         [[[[100.0, 1.0], [150.0, 0.8], [200.0, 0.6], [250.0, 0.4],
