@@ -379,7 +379,6 @@ def main() -> None:
         condition_encoder: nn.Module = SpectrumConditionEncoder(
             metadata_dim=int(dataset.manifest["metadata_dim"]),
             dim=condition_dim,
-            fourier_bands=int(spectrum_config["fourier_bands"]),
             heads=int(spectrum_config["heads"]),
             peak_layers=int(spectrum_config["peak_layers"]),
             spectrum_layers=int(spectrum_config["spectrum_layers"]),
@@ -387,7 +386,9 @@ def main() -> None:
             relative_mass_max=float(spectrum_config["relative_mass_max"]),
             ffn_ratio=float(spectrum_config["ffn_ratio"]),
             dropout=float(spectrum_config["dropout"]),
-            mz_reference=float(spectrum_config["mz_reference"]),
+            peak_position_dim=int(spectrum_config["peak_position_dim"]),
+            mz_bin_width=float(spectrum_config["mz_bin_width"]),
+            mz_upper_bound=float(spectrum_config["mz_upper_bound"]),
             peak_chunk_size=peak_chunk_size,
             peak_chunk_batch=int(spectrum_config.get("peak_chunk_batch", 256)),
         ).to(device)

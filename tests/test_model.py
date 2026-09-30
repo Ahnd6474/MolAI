@@ -2,7 +2,7 @@ import torch
 
 from molai.models.bridge import GeometricVESchedule, VPSchedule
 from molai.models.cloud import MolecularCloudModel, MolecularFieldCloud
-from molai.models.condition import AffinePeakEmbedding, SpectrumConditionEncoder
+from molai.models.condition import PositionwiseAffinePeakEmbedding, SpectrumConditionEncoder
 from molai.models.image_smiles import FieldToSmiles
 from molai.models.losses import FullBandEnergyDistance, full_band_distance
 from molai.models.smiles import SmilesTokenizer
@@ -153,6 +153,9 @@ def test_spectrum_condition_attention_shapes_and_backward() -> None:
         peak_layers=2,
         spectrum_layers=1,
         dropout=0.0,
+        peak_position_dim=8,
+        mz_bin_width=1.0,
+        mz_upper_bound=1_000.0,
     )
     inputs = _spectrum_inputs()
     condition = encoder(*inputs)
@@ -160,7 +163,7 @@ def test_spectrum_condition_attention_shapes_and_backward() -> None:
     assert condition.shape == (2, 32)
     assert torch.isfinite(condition).all()
     condition.square().mean().backward()
-    assert encoder.peak_embedding.coefficient_projection[0].weight.grad is not None
+    assert encoder.peak_embedding.slope.weight.grad is not None
     assert encoder.peak_blocks[0].attention.relative_projection.weight.grad is not None
 
 
@@ -172,6 +175,9 @@ def test_spectrum_condition_attention_supports_bfloat16_autocast() -> None:
         peak_layers=1,
         spectrum_layers=1,
         dropout=0.0,
+        peak_position_dim=8,
+        mz_bin_width=1.0,
+        mz_upper_bound=1_000.0,
     )
     with torch.autocast("cpu", dtype=torch.bfloat16):
         condition = encoder(*_spectrum_inputs())
@@ -181,7 +187,12 @@ def test_spectrum_condition_attention_supports_bfloat16_autocast() -> None:
 
 
 def test_peak_embedding_is_affine_in_raw_intensity() -> None:
-    embedding = AffinePeakEmbedding(dim=16, fourier_bands=4)
+    embedding = PositionwiseAffinePeakEmbedding(
+        dim=16,
+        position_dim=8,
+        mz_bin_width=0.01,
+        mz_upper_bound=1_000.0,
+    )
     mz = torch.tensor([[100.0, 250.0, 900.0]])
     zero = embedding(mz, torch.zeros_like(mz))
     one = embedding(mz, torch.ones_like(mz))
@@ -190,6 +201,7 @@ def test_peak_embedding_is_affine_in_raw_intensity() -> None:
     torch.testing.assert_close(two - zero, 2.0 * (one - zero))
     _, intercept = embedding.coefficients(mz)
     torch.testing.assert_close(zero, intercept)
+    assert embedding.position_indices(torch.tensor([100.0, 100.01])).tolist() == [10000, 10001]
 
 
 def test_spectrum_condition_attention_is_set_invariant() -> None:
@@ -200,6 +212,9 @@ def test_spectrum_condition_attention_is_set_invariant() -> None:
         peak_layers=2,
         spectrum_layers=2,
         dropout=0.0,
+        peak_position_dim=8,
+        mz_bin_width=1.0,
+        mz_upper_bound=1_000.0,
     ).eval()
     peaks, peak_mask, spectrum_mask, metadata, precursor_mz = _spectrum_inputs()
     expected = encoder(peaks, peak_mask, spectrum_mask, metadata, precursor_mz)
@@ -233,6 +248,9 @@ def test_spectrum_condition_attention_uses_all_peak_chunks() -> None:
         peak_layers=1,
         spectrum_layers=1,
         dropout=0.0,
+        peak_position_dim=8,
+        mz_bin_width=1.0,
+        mz_upper_bound=1_000.0,
         peak_chunk_size=4,
     ).eval()
     peaks = torch.tensor(

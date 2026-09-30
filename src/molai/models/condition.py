@@ -6,6 +6,7 @@ import math
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 
 class SmilesConditionEncoder(nn.Module):
@@ -40,41 +41,37 @@ class SmilesConditionEncoder(nn.Module):
         return self.output(pooled)
 
 
-class AffinePeakEmbedding(nn.Module):
-    """Encode each peak exactly as ``a(m/z) * intensity + b(m/z)``."""
+class PositionwiseAffinePeakEmbedding(nn.Module):
+    """Give every discretized m/z position its own learnable affine vectors."""
 
     def __init__(
         self,
         dim: int,
-        fourier_bands: int = 12,
-        mz_reference: float = 1_500.0,
+        position_dim: int = 32,
+        mz_bin_width: float = 0.01,
+        mz_upper_bound: float = 5_000.0,
     ) -> None:
         super().__init__()
-        self.fourier_bands = fourier_bands
-        self.mz_reference = mz_reference
-        position_dim = fourier_bands * 2 + 1
-        self.coefficient_projection = nn.Sequential(
-            nn.Linear(position_dim, dim),
-            nn.SiLU(),
-            nn.Linear(dim, dim * 2),
-        )
+        if position_dim < 1 or mz_bin_width <= 0.0 or mz_upper_bound <= 0.0:
+            raise ValueError("peak position configuration must be positive")
+        self.mz_bin_width = mz_bin_width
+        self.mz_upper_bound = mz_upper_bound
+        self.position_count = math.ceil(mz_upper_bound / mz_bin_width) + 1
+        self.slope = nn.Embedding(self.position_count, position_dim)
+        self.intercept_table = nn.Embedding(self.position_count, position_dim)
+        self.output = nn.Linear(position_dim, dim)
+        nn.init.normal_(self.slope.weight, std=0.02)
+        nn.init.normal_(self.intercept_table.weight, std=0.02)
 
-    def _position_features(self, values: Tensor) -> Tensor:
-        normalized = torch.log1p(values.clamp_min(0.0)) / math.log1p(self.mz_reference)
-        frequencies = 2.0 ** torch.arange(
-            self.fourier_bands,
-            device=values.device,
-            dtype=values.dtype,
-        )
-        angles = 2.0 * math.pi * normalized.unsqueeze(-1) * frequencies
-        return torch.cat(
-            (normalized.unsqueeze(-1), angles.sin(), angles.cos()), dim=-1
-        )
+    def position_indices(self, mz: Tensor) -> Tensor:
+        return (mz / self.mz_bin_width).round().long().clamp(0, self.position_count - 1)
 
     def coefficients(self, mz: Tensor) -> tuple[Tensor, Tensor]:
-        slope, intercept = self.coefficient_projection(
-            self._position_features(mz)
-        ).chunk(2, dim=-1)
+        positions = self.position_indices(mz)
+        slope = F.linear(self.slope(positions), self.output.weight)
+        intercept = F.linear(
+            self.intercept_table(positions), self.output.weight, self.output.bias
+        )
         return slope, intercept
 
     def intercept(self, mz: Tensor) -> Tensor:
@@ -241,7 +238,6 @@ class SpectrumConditionEncoder(nn.Module):
         self,
         metadata_dim: int,
         dim: int = 384,
-        fourier_bands: int = 12,
         heads: int = 8,
         peak_layers: int = 3,
         spectrum_layers: int = 2,
@@ -249,7 +245,9 @@ class SpectrumConditionEncoder(nn.Module):
         relative_mass_max: float = 256.0,
         ffn_ratio: float = 2.0,
         dropout: float = 0.1,
-        mz_reference: float = 1_500.0,
+        peak_position_dim: int = 32,
+        mz_bin_width: float = 0.01,
+        mz_upper_bound: float = 5_000.0,
         peak_chunk_size: int = 256,
         peak_chunk_batch: int = 256,
     ) -> None:
@@ -262,14 +260,20 @@ class SpectrumConditionEncoder(nn.Module):
             raise ValueError("peak_chunk_batch must be positive")
         self.peak_chunk_size = peak_chunk_size
         self.peak_chunk_batch = peak_chunk_batch
-        self.mz_reference = mz_reference
-        self.peak_embedding = AffinePeakEmbedding(
+        self.mz_upper_bound = mz_upper_bound
+        self.peak_embedding = PositionwiseAffinePeakEmbedding(
             dim,
-            fourier_bands=fourier_bands,
-            mz_reference=mz_reference,
+            position_dim=peak_position_dim,
+            mz_bin_width=mz_bin_width,
+            mz_upper_bound=mz_upper_bound,
         )
         self.metadata_embedding = nn.Sequential(
             nn.Linear(metadata_dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
+        self.precursor_embedding = nn.Sequential(
+            nn.Linear(1, dim),
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
@@ -394,10 +398,14 @@ class SpectrumConditionEncoder(nn.Module):
             raise ValueError("precursor_mz must have shape [S]")
 
         precursor_mz = torch.nan_to_num(
-            precursor_mz, nan=0.0, posinf=self.mz_reference, neginf=0.0
+            precursor_mz, nan=0.0, posinf=self.mz_upper_bound, neginf=0.0
         )
         metadata_tokens = self.metadata_embedding(metadata)
-        metadata_tokens = metadata_tokens + self.peak_embedding.intercept(precursor_mz)
+        precursor_feature = torch.log1p(precursor_mz.clamp_min(0.0))
+        precursor_feature = precursor_feature / math.log1p(self.mz_upper_bound)
+        metadata_tokens = metadata_tokens + self.precursor_embedding(
+            precursor_feature.unsqueeze(-1)
+        )
         chunk_embedding_parts: list[Tensor] = []
         for start in range(0, len(peak_chunks), self.peak_chunk_batch):
             end = min(start + self.peak_chunk_batch, len(peak_chunks))
@@ -405,7 +413,7 @@ class SpectrumConditionEncoder(nn.Module):
             mask_slice = peak_mask[start:end].bool()
             mapping_slice = chunk_to_spectrum[start:end]
             mz = torch.nan_to_num(
-                chunk_slice[..., 0], nan=0.0, posinf=self.mz_reference, neginf=0.0
+                chunk_slice[..., 0], nan=0.0, posinf=self.mz_upper_bound, neginf=0.0
             )
             intensity = torch.nan_to_num(
                 chunk_slice[..., 1], nan=0.0, posinf=1.0, neginf=0.0
