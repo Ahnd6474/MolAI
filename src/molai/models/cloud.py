@@ -12,6 +12,7 @@ from torch.utils.checkpoint import checkpoint
 from molai.models.attention import (
     AxialLocalCrossBlock,
     AxialLocalMixerBlock,
+    NoiseTokenCrossBlock,
     sinusoidal_2d_position,
 )
 from molai.models.condition import AxialConditionPlane
@@ -39,6 +40,7 @@ class MolecularFieldCloud(nn.Module):
         heads: int = 4,
         condition_cross_depth: int = 2,
         noise_cross_depth: int = 2,
+        noise_token_count: int = 64,
         refine_depth: int = 8,
         window_size: int = 8,
         ffn_ratio: float = 2.0,
@@ -52,11 +54,14 @@ class MolecularFieldCloud(nn.Module):
         super().__init__()
         if dim % heads or dim % 4:
             raise ValueError("dim must be divisible by heads and by four")
+        if noise_token_count < 1:
+            raise ValueError("noise_token_count must be positive")
         self.field_channels = field_channels
         self.dim = dim
         self.max_residual = max_residual
         self.noise_energy_min = noise_energy_min
         self.noise_amplitude_max = noise_amplitude_max
+        self.noise_token_count = noise_token_count
         self.gradient_checkpointing = gradient_checkpointing
 
         self.field_embed = nn.Linear(field_channels, dim)
@@ -78,15 +83,13 @@ class MolecularFieldCloud(nn.Module):
         )
         self.noise_blocks = nn.ModuleList(
             [
-                AxialLocalCrossBlock(
+                NoiseTokenCrossBlock(
                     dim,
                     heads,
-                    window_size,
                     ffn_ratio,
-                    shifted=bool(index % 2),
                     gate_init=0.1,
                 )
-                for index in range(noise_cross_depth)
+                for _ in range(noise_cross_depth)
             ]
         )
         pattern = ("local", "row", "local", "column")
@@ -109,6 +112,8 @@ class MolecularFieldCloud(nn.Module):
         nn.init.zeros_(self.energy_head.weight)
         nn.init.constant_(self.energy_head.bias, math.log(math.expm1(initial_amplitude)))
         self.noise_projection = nn.Linear(field_channels, dim, bias=False)
+        self.noise_token_basis = nn.Parameter(torch.empty(noise_token_count, dim))
+        nn.init.normal_(self.noise_token_basis, std=0.02)
         self.output_norm = nn.LayerNorm(dim)
         self.output_head = nn.Linear(dim, field_channels)
         self.readout = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, condition_dim))
@@ -145,27 +150,32 @@ class MolecularFieldCloud(nn.Module):
         samples: int,
         noise: Tensor | None,
     ) -> Tensor:
-        batch, height, width, _ = encoded.shape
+        batch = encoded.shape[0]
         if noise is None:
-            return torch.randn(
+            random_noise = torch.randn(
                 batch,
                 samples,
-                height,
-                width,
+                self.noise_token_count,
                 self.dim,
                 device=encoded.device,
                 dtype=encoded.dtype,
             )
-        if noise.ndim != 5 or noise.shape[:2] != (batch, samples):
-            raise ValueError("noise must have shape [B,M,C,H,W]")
-        if noise.shape[-2:] != (height, width):
-            raise ValueError("noise spatial shape must match current")
-        noise = noise.permute(0, 1, 3, 4, 2)
-        if noise.shape[-1] == self.dim:
-            return noise
-        if noise.shape[-1] == self.field_channels:
-            return self.noise_projection(noise)
-        raise ValueError("noise channels must match field_channels or model dim")
+        else:
+            if noise.ndim != 4 or noise.shape[:3] != (
+                batch,
+                samples,
+                self.noise_token_count,
+            ):
+                raise ValueError(
+                    "noise must have shape [B,M,K,D] or [B,M,K,C], "
+                    "where K is noise_token_count"
+                )
+            random_noise = noise.to(device=encoded.device, dtype=encoded.dtype)
+            if random_noise.shape[-1] == self.field_channels:
+                random_noise = self.noise_projection(random_noise)
+            elif random_noise.shape[-1] != self.dim:
+                raise ValueError("noise channels must match field_channels or model dim")
+        return random_noise + self.noise_token_basis.to(dtype=encoded.dtype)[None, None]
 
     def forward(
         self,
@@ -176,15 +186,19 @@ class MolecularFieldCloud(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         encoded = self.encode_condition(current, condition)
         energy = self.spatial_noise_energy(encoded)
-        latent_noise = self._prepare_noise(encoded, samples, noise)
-        latent_noise = latent_noise * (energy / self.dim).sqrt()[:, None, :, :, None]
+        noise_tokens = self._prepare_noise(encoded, samples, noise)
 
-        batch, _, height, width, _ = latent_noise.shape
-        tokens = encoded[:, None].expand(-1, samples, -1, -1, -1) + latent_noise
+        batch, height, width, _ = encoded.shape
+        tokens = encoded[:, None].expand(-1, samples, -1, -1, -1)
         tokens = tokens.reshape(batch * samples, height, width, self.dim)
-        noise_context = latent_noise.reshape(batch * samples, height, width, self.dim)
+        noise_context = noise_tokens.reshape(
+            batch * samples, self.noise_token_count, self.dim
+        )
+        spatial_amplitude = (energy / self.dim).sqrt()
+        spatial_amplitude = spatial_amplitude[:, None].expand(-1, samples, -1, -1)
+        spatial_amplitude = spatial_amplitude.reshape(batch * samples, height, width)
         for block in self.noise_blocks:
-            tokens = self._run(block, tokens, noise_context)
+            tokens = self._run(block, tokens, noise_context, spatial_amplitude)
         for block in self.refine_blocks:
             tokens = self._run(block, tokens)
 

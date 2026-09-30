@@ -11,6 +11,7 @@ import math
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 
 def sinusoidal_2d_position(
@@ -211,6 +212,78 @@ class AxialLocalCrossBlock(nn.Module):
         ):
             update = attention(query_norm(query), context_norm(context))
             query = query + torch.sigmoid(self.gates[index]) * update
+        return query + self.ff(query)
+
+
+class NoiseTokenCrossBlock(nn.Module):
+    """Cross-attend every image token to a short, per-sample noise sequence.
+
+    Query and noise-token batches are already flattened to ``B * M``.  One
+    scaled-dot-product-attention call therefore processes every cloud sample
+    while keeping samples completely independent from one another.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        ffn_ratio: float = 2.0,
+        gate_init: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if dim % heads:
+            raise ValueError("dim must be divisible by heads")
+        self.heads = heads
+        self.head_dim = dim // heads
+        hidden = round(dim * ffn_ratio)
+        self.query_norm = nn.LayerNorm(dim)
+        self.noise_norm = nn.LayerNorm(dim)
+        self.query_projection = nn.Linear(dim, dim)
+        self.key_value_projection = nn.Linear(dim, 2 * dim)
+        self.output_projection = nn.Linear(dim, dim)
+        self.gate = nn.Parameter(torch.tensor(math.log(gate_init / (1.0 - gate_init))))
+        self.ff = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(
+        self,
+        query: Tensor,
+        noise_tokens: Tensor,
+        spatial_amplitude: Tensor,
+    ) -> Tensor:
+        if query.ndim != 4 or noise_tokens.ndim != 3:
+            raise ValueError("query must be [B,H,W,D] and noise_tokens must be [B,K,D]")
+        batch, height, width, dim = query.shape
+        if noise_tokens.shape[0] != batch or noise_tokens.shape[-1] != dim:
+            raise ValueError("query and noise token batch/dimension must match")
+        if spatial_amplitude.shape != (batch, height, width):
+            raise ValueError("spatial_amplitude must have shape [B,H,W]")
+
+        flat_query = self.query_norm(query).reshape(batch, height * width, dim)
+        projected_query = self.query_projection(flat_query)
+        projected_query = projected_query.reshape(
+            batch, height * width, self.heads, self.head_dim
+        ).transpose(1, 2)
+
+        key_value = self.key_value_projection(self.noise_norm(noise_tokens))
+        key_value = key_value.reshape(
+            batch, noise_tokens.shape[1], 2, self.heads, self.head_dim
+        ).permute(2, 0, 3, 1, 4)
+        key, value = key_value.unbind(0)
+        update = F.scaled_dot_product_attention(
+            projected_query,
+            key,
+            value,
+            dropout_p=0.0,
+        )
+        update = update.transpose(1, 2).reshape(batch, height, width, dim)
+        update = self.output_projection(update)
+        update = update * spatial_amplitude[..., None]
+        query = query + torch.sigmoid(self.gate) * update
         return query + self.ff(query)
 
 

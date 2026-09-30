@@ -5,6 +5,7 @@ model:
   heads: 4
   condition_cross_depth: 2
   noise_cross_depth: 2
+  noise_token_count: 64
   refine_depth: 8
   window_size: 8
   ffn_ratio: 2.0
@@ -13,14 +14,9 @@ model:
   noise_energy_min: 0.0001
   noise_energy_init: 0.1
   noise_amplitude_max: 8.0
-  gradient_checkpointing: true
+  gradient_checkpointing: false
 
 cloud_matching:
   samples: 4
   loss: energy_full_band
   full_band_levels: 3
-
-smiles_decoder:
-  hidden_dim: 384
-  layers: 4
-  max_length: 256

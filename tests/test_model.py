@@ -1,7 +1,7 @@
 import torch
 
 from molai.models.bridge import VPSchedule
-from molai.models.cloud import MolecularCloudModel
+from molai.models.cloud import MolecularCloudModel, MolecularFieldCloud
 from molai.models.condition import SpectrumConditionEncoder
 from molai.models.image_smiles import FieldToSmiles
 from molai.models.losses import FullBandEnergyDistance
@@ -46,6 +46,31 @@ def test_bridge_and_energy_distance() -> None:
     assert bridge.current.shape == clean.shape
     assert bridge.target_cloud.shape == (2, 3, 1, 16, 16)
     assert abs(float(loss)) < 1e-5
+
+
+def test_noise_token_cloud_is_deterministic_and_sample_independent() -> None:
+    model = MolecularFieldCloud(
+        condition_dim=32,
+        field_channels=1,
+        dim=32,
+        heads=4,
+        condition_cross_depth=1,
+        noise_cross_depth=1,
+        noise_token_count=8,
+        refine_depth=1,
+        window_size=4,
+        max_resolution=16,
+        gradient_checkpointing=False,
+    ).eval()
+    current = torch.zeros(1, 1, 8, 8)
+    condition = torch.randn(1, 32)
+    noise = torch.randn(1, 2, 8, 32)
+
+    first, _, _ = model(current, condition, samples=2, noise=noise)
+    second, _, _ = model(current, condition, samples=2, noise=noise)
+
+    torch.testing.assert_close(first, second)
+    assert not torch.allclose(first[:, 0], first[:, 1])
 
 
 def test_smiles_tokenizer_round_trip() -> None:

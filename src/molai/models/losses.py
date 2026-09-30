@@ -48,9 +48,10 @@ def _pairwise_cloud_distance(first: Tensor, second: Tensor, levels: int) -> Tens
 class FullBandEnergyDistance(nn.Module):
     """Energy distance between empirical clouds of field corrections."""
 
-    def __init__(self, levels: int = 3) -> None:
+    def __init__(self, levels: int = 3, include_target_constant: bool = True) -> None:
         super().__init__()
         self.levels = levels
+        self.include_target_constant = include_target_constant
 
     def forward(self, predicted: Tensor, target: Tensor, current: Tensor) -> Tensor:
         if predicted.ndim != 5 or target.ndim != 5:
@@ -63,7 +64,10 @@ class FullBandEnergyDistance(nn.Module):
         within_predicted = _pairwise_cloud_distance(
             predicted_correction, predicted_correction, self.levels
         ).mean()
-        within_target = _pairwise_cloud_distance(
-            target_correction, target_correction, self.levels
-        ).mean()
-        return 2.0 * cross - within_predicted - within_target
+        loss = 2.0 * cross - within_predicted
+        if self.include_target_constant:
+            within_target = _pairwise_cloud_distance(
+                target_correction, target_correction, self.levels
+            ).mean()
+            loss = loss - within_target
+        return loss
