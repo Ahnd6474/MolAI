@@ -2,6 +2,7 @@ import torch
 
 from molai.models.bridge import VPSchedule
 from molai.models.cloud import MolecularCloudModel
+from molai.models.condition import SpectrumConditionEncoder
 from molai.models.image_smiles import FieldToSmiles
 from molai.models.losses import FullBandEnergyDistance
 from molai.models.smiles import SmilesTokenizer
@@ -59,3 +60,103 @@ def test_field_to_smiles_probe_shapes() -> None:
     input_ids = torch.randint(0, 20, (2, 11))
     assert model(fields, input_ids).shape == (2, 11, 20)
     assert model.generate(fields, bos_token_id=1, eos_token_id=2, max_length=7).shape[0] == 2
+
+
+def _spectrum_inputs() -> tuple[torch.Tensor, ...]:
+    torch.manual_seed(7)
+    peaks = torch.rand(2, 3, 6, 2)
+    peaks[..., 0] = 50.0 + 600.0 * peaks[..., 0]
+    peak_mask = torch.tensor(
+        [
+            [[1, 1, 1, 1, 0, 0], [1, 1, 1, 0, 0, 0], [0, 0, 0, 0, 0, 0]],
+            [[1, 1, 1, 1, 1, 1], [1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 0, 0]],
+        ],
+        dtype=torch.bool,
+    )
+    spectrum_mask = torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.bool)
+    metadata = torch.randn(2, 3, 5)
+    precursor_mz = torch.tensor([[700.0, 500.0, 0.0], [800.0, 450.0, 650.0]])
+    return peaks, peak_mask, spectrum_mask, metadata, precursor_mz
+
+
+def test_spectrum_condition_attention_shapes_and_backward() -> None:
+    encoder = SpectrumConditionEncoder(
+        metadata_dim=5,
+        dim=32,
+        heads=4,
+        peak_layers=2,
+        spectrum_layers=1,
+        dropout=0.0,
+    )
+    inputs = _spectrum_inputs()
+    condition = encoder(*inputs)
+
+    assert condition.shape == (2, 32)
+    assert torch.isfinite(condition).all()
+    condition.square().mean().backward()
+    assert encoder.peak_embedding.intensity_direction[0].weight.grad is not None
+    assert encoder.peak_blocks[0].attention.relative_projection.weight.grad is not None
+
+
+def test_spectrum_condition_attention_is_set_invariant() -> None:
+    encoder = SpectrumConditionEncoder(
+        metadata_dim=5,
+        dim=32,
+        heads=4,
+        peak_layers=2,
+        spectrum_layers=2,
+        dropout=0.0,
+    ).eval()
+    peaks, peak_mask, spectrum_mask, metadata, precursor_mz = _spectrum_inputs()
+    expected = encoder(peaks, peak_mask, spectrum_mask, metadata, precursor_mz)
+
+    peak_order = torch.tensor([2, 0, 5, 1, 4, 3])
+    peak_permuted = encoder(
+        peaks[:, :, peak_order],
+        peak_mask[:, :, peak_order],
+        spectrum_mask,
+        metadata,
+        precursor_mz,
+    )
+    spectrum_order = torch.tensor([2, 0, 1])
+    spectrum_permuted = encoder(
+        peaks[:, spectrum_order],
+        peak_mask[:, spectrum_order],
+        spectrum_mask[:, spectrum_order],
+        metadata[:, spectrum_order],
+        precursor_mz[:, spectrum_order],
+    )
+
+    torch.testing.assert_close(peak_permuted, expected, atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(spectrum_permuted, expected, atol=2e-6, rtol=2e-6)
+
+
+def test_spectrum_condition_attention_keeps_strongest_peaks() -> None:
+    encoder = SpectrumConditionEncoder(
+        metadata_dim=2,
+        dim=16,
+        heads=4,
+        peak_layers=1,
+        spectrum_layers=1,
+        dropout=0.0,
+        max_peaks=4,
+    ).eval()
+    peaks = torch.tensor(
+        [[[[100.0, 1.0], [150.0, 0.8], [200.0, 0.6], [250.0, 0.4],
+           [300.0, 0.01], [350.0, 0.001]]]]
+    )
+    peak_mask = torch.ones(1, 1, 6, dtype=torch.bool)
+    spectrum_mask = torch.ones(1, 1, dtype=torch.bool)
+    metadata = torch.zeros(1, 1, 2)
+    precursor_mz = torch.tensor([[400.0]])
+
+    truncated = encoder(
+        peaks[:, :, :4],
+        peak_mask[:, :, :4],
+        spectrum_mask,
+        metadata,
+        precursor_mz,
+    )
+    selected = encoder(peaks, peak_mask, spectrum_mask, metadata, precursor_mz)
+
+    torch.testing.assert_close(selected, truncated, atol=2e-6, rtol=2e-6)

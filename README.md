@@ -191,10 +191,15 @@ resolution ablations; it does not resize the input automatically.
 
 ### 5. Spectrum conditioning and decoding
 
-`SpectrumConditionEncoder` treats the peaks of each spectrum as a set. It Fourier-encodes
-normalized m/z and intensity, combines mean and max peak summaries with spectrum metadata,
-then aggregates all spectra belonging to the same molecule. This produces the same
-conditioning width as `SmilesConditionEncoder`.
+`SpectrumConditionEncoder` treats peaks and replicate spectra as unordered sets. Each
+observed peak becomes a continuous affine token
+`B(m/z) + g(intensity) * A(m/z) + C(precursor_mz - m/z)`. Peak self-attention includes a
+learned per-head bias for pairwise absolute mass gaps, allowing isotope spacing and common
+fragment-loss relationships to influence attention directly. A second attention stage
+combines collision-energy/adduct/instrument metadata across all spectra belonging to one
+molecule. Spectra are capped at the 256 strongest observed peaks before quadratic attention;
+the original competition data contains pathological spectra with more than 70,000 peaks.
+The final molecule token has the same conditioning width as `SmilesConditionEncoder`.
 
 The generated field tokens are mean-pooled into molecular embeddings and passed to an
 autoregressive GRU SMILES decoder. The planned inference stage will validate generated
