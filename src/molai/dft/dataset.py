@@ -5,10 +5,13 @@ from __future__ import annotations
 import csv
 import gzip
 import hashlib
+import io
 import json
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO, TextIO
 
 import torch
 from rdkit import Chem
@@ -19,12 +22,35 @@ from molai.dft.solver import DFT2DConfig, DFT2DResult
 
 SolverConfig = DFT2DConfig | KohnSham2DConfig
 SolverResult = DFT2DResult | KohnSham2DResult
+_READ_BUFFER_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
 class StructureRecord:
     identifier: str
     smiles: str
+
+
+@contextmanager
+def _open_binary_stream(path: Path) -> Iterator[BinaryIO]:
+    with path.open("rb", buffering=_READ_BUFFER_BYTES) as raw:
+        if path.suffix != ".gz":
+            yield raw
+            return
+        with (
+            gzip.GzipFile(fileobj=raw) as compressed,
+            io.BufferedReader(compressed, buffer_size=_READ_BUFFER_BYTES) as buffered,
+        ):
+            yield buffered
+
+
+@contextmanager
+def _open_text_stream(path: Path, newline: str | None = None) -> Iterator[TextIO]:
+    with (
+        _open_binary_stream(path) as binary,
+        io.TextIOWrapper(binary, encoding="utf-8", newline=newline) as text,
+    ):
+        yield text
 
 
 def iter_structure_records(
@@ -61,20 +87,17 @@ def iter_structure_records(
         for batch in parquet_file.iter_batches(
             batch_size=parquet_batch_size, columns=[id_column, smiles_column]
         ):
-            columns = batch.to_pydict()
+            identifiers = batch.column(0).to_pylist()
+            smiles_values = batch.column(1).to_pylist()
             for identifier, smiles in zip(
-                columns[id_column], columns[smiles_column], strict=True
+                identifiers, smiles_values, strict=True
             ):
                 identifier_text = str(identifier)
                 if smiles is not None and unseen(identifier_text):
                     yield StructureRecord(identifier_text, str(smiles))
         return
     if path.suffix == ".csv" or suffixes[-2:] == [".csv", ".gz"]:
-        with (
-            gzip.open(path, "rt", encoding="utf-8", newline="")
-            if path.suffix == ".gz"
-            else path.open("r", encoding="utf-8", newline="")
-        ) as handle:
+        with _open_text_stream(path, newline="") as handle:
             reader = csv.DictReader(handle)
             for row_number, row in enumerate(reader):
                 smiles = row.get(smiles_column)
@@ -84,20 +107,17 @@ def iter_structure_records(
         return
     text_suffix = suffixes[-2] if path.suffix == ".gz" and len(suffixes) >= 2 else path.suffix
     if text_suffix in {".smi", ".smiles", ".txt"}:
-        with (
-            gzip.open(path, "rt", encoding="utf-8")
-            if path.suffix == ".gz"
-            else path.open("r", encoding="utf-8")
-        ) as handle:
+        with _open_binary_stream(path) as handle:
             for index, line in enumerate(handle):
-                value = line.strip().split()
+                value = line.split(maxsplit=2)
                 if value:
-                    identifier = value[1] if len(value) > 1 else str(index)
+                    smiles = value[0].decode("utf-8")
+                    identifier = value[1].decode("utf-8") if len(value) > 1 else str(index)
                     if unseen(identifier):
-                        yield StructureRecord(identifier, value[0])
+                        yield StructureRecord(identifier, smiles)
         return
     if path.suffix == ".sdf" or suffixes[-2:] == [".sdf", ".gz"]:
-        with gzip.open(path, "rb") if path.suffix == ".gz" else path.open("rb") as handle:
+        with _open_binary_stream(path) as handle:
             supplier = Chem.ForwardSDMolSupplier(handle, sanitize=True, removeHs=True)
             for index, molecule in enumerate(supplier):
                 if molecule is None:

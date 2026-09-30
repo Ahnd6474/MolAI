@@ -8,7 +8,7 @@ import itertools
 import json
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -22,6 +22,8 @@ from molai.fields import (
     ExpectedChargeTrainingBatchResult,
     TrainingChannel,
 )
+
+_OUTPUT_BUFFER_BYTES = 16 * 1024 * 1024
 
 
 def replace_file_with_retry(source: Path, destination: Path, attempts: int = 6) -> None:
@@ -92,7 +94,7 @@ class SingleChannelShardWriter:
         self.shard_size = shard_size
         self.deduplicate = deduplicate
         self.configuration = {
-            "renderer": "expected_charge_v5",
+            "renderer": "expected_charge_v6",
             "channel": channel,
             "dtype": str(dtype).removeprefix("torch."),
             "deduplicate": deduplicate,
@@ -117,6 +119,13 @@ class SingleChannelShardWriter:
         self.pending_sum_of_squares = 0.0
         self.pending_minimum: float | None = None
         self.pending_maximum: float | None = None
+        self.transfer_events: list[torch.cuda.Event] = []
+        self.inflight_records = 0
+        self._io_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="molai-shard-writer"
+        )
+        self._write_future: Future[None] | None = None
+        self._inflight_transaction: dict[str, object] | None = None
 
         if self.manifest_path.exists():
             self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
@@ -128,7 +137,7 @@ class SingleChannelShardWriter:
             if any(output_dir.iterdir()):
                 raise ValueError("output directory is non-empty but has no manifest")
             self.manifest = {
-                "format": "molai-expected-charge-v5",
+                "format": "molai-expected-charge-v6",
                 "source": str(source.resolve()),
                 "config_hash": self.config_hash,
                 **self.configuration,
@@ -154,7 +163,11 @@ class SingleChannelShardWriter:
 
     @property
     def successful_records(self) -> int:
-        return int(self.manifest["successful_records"]) + self.pending_records
+        return (
+            int(self.manifest["successful_records"])
+            + self.inflight_records
+            + self.pending_records
+        )
 
     def _load_seen_keys(self) -> set[str]:
         committed_records = int(self.manifest["successful_records"])
@@ -198,8 +211,42 @@ class SingleChannelShardWriter:
         source_offset: int,
         failed: int,
     ) -> None:
-        channel = result.channel.detach().to(device="cpu", dtype=self.dtype)
+        channel = self._copy_to_host(result.channel, self.dtype)
         self.channel_batches.append(channel)
+        if result.channel.device.type != "cuda":
+            self._accumulate_statistics(channel)
+        self.canonical_smiles.extend(result.canonical_smiles)
+        self.molecule_keys.extend(result.molecule_keys)
+        self.source_ids.extend(source_ids)
+        self.formal_charge_batches.append(
+            self._copy_to_host(result.formal_charge, torch.int16)
+        )
+        self.electron_count_batches.append(
+            self._copy_to_host(result.expected_electron_count, torch.float32)
+        )
+        self.integrated_charge_batches.append(
+            self._copy_to_host(result.integrated_charge, torch.float32)
+        )
+        if result.channel.device.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(result.channel.device))
+            self.transfer_events.append(event)
+        self.pending_records += len(result.canonical_smiles)
+        self.pending_failed += failed
+        self.pending_source_offset = source_offset
+        if self.pending_records >= self.shard_size:
+            self.flush()
+
+    @staticmethod
+    def _copy_to_host(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        tensor = tensor.detach()
+        if tensor.device.type != "cuda":
+            return tensor.to(device="cpu", dtype=dtype)
+        host = torch.empty(tensor.shape, device="cpu", dtype=dtype, pin_memory=True)
+        host.copy_(tensor, non_blocking=True)
+        return host
+
+    def _accumulate_statistics(self, channel: torch.Tensor) -> None:
         statistics_values = channel.float()
         self.pending_elements += statistics_values.numel()
         self.pending_sum += float(statistics_values.sum(dtype=torch.float64))
@@ -218,21 +265,6 @@ class SingleChannelShardWriter:
             if self.pending_maximum is None
             else max(self.pending_maximum, batch_maximum)
         )
-        self.canonical_smiles.extend(result.canonical_smiles)
-        self.molecule_keys.extend(result.molecule_keys)
-        self.source_ids.extend(source_ids)
-        self.formal_charge_batches.append(result.formal_charge.detach().cpu().to(torch.int16))
-        self.electron_count_batches.append(
-            result.expected_electron_count.detach().cpu().to(torch.float32)
-        )
-        self.integrated_charge_batches.append(
-            result.integrated_charge.detach().cpu().to(torch.float32)
-        )
-        self.pending_records += len(result.canonical_smiles)
-        self.pending_failed += failed
-        self.pending_source_offset = source_offset
-        if self.pending_records >= self.shard_size:
-            self.flush()
 
     def note_empty_batch(self, source_offset: int, failed: int) -> None:
         self.pending_failed += failed
@@ -241,6 +273,7 @@ class SingleChannelShardWriter:
     def flush(self) -> None:
         if not self.pending_records:
             if self.pending_source_offset != self.source_offset:
+                self._finish_inflight()
                 self.manifest["source_offset"] = self.pending_source_offset
                 self.manifest["failed_records"] += self.pending_failed
                 self.manifest["duplicate_records"] += self.pending_duplicates
@@ -249,6 +282,12 @@ class SingleChannelShardWriter:
                 self._write_manifest()
             return
 
+        self._finish_inflight()
+        if self.transfer_events:
+            self.transfer_events[-1].synchronize()
+            self.transfer_events.clear()
+            for batch in self.channel_batches:
+                self._accumulate_statistics(batch)
         channel = torch.cat(self.channel_batches)
         formal_charge = torch.cat(self.formal_charge_batches)
         electron_count = torch.cat(self.electron_count_batches)
@@ -257,55 +296,43 @@ class SingleChannelShardWriter:
         shard_name = f"fields-{shard_index:06d}.pt"
         shard_path = self.output_dir / shard_name
         temporary_path = self.output_dir / f".{shard_name}.tmp"
-        torch.save(
-            {
-                self.channel: channel,
-                "formal_charge": formal_charge,
-                "electron_count": electron_count,
-                "integrated_charge": integrated_charge,
-                "canonical_smiles": self.canonical_smiles,
-                "molecule_key": self.molecule_keys,
-                "source_id": self.source_ids,
-            },
-            temporary_path,
-        )
-        replace_file_with_retry(temporary_path, shard_path)
-
-        if self.deduplicate:
-            with self.keys_path.open("a", encoding="ascii", newline="\n") as handle:
-                handle.writelines(f"{key}\n" for key in self.molecule_keys)
-                handle.flush()
-                os.fsync(handle.fileno())
-
-        statistics = self.manifest["statistics"]
-        statistics["elements"] += self.pending_elements
-        statistics["sum"] += self.pending_sum
-        statistics["sum_of_squares"] += self.pending_sum_of_squares
         if self.pending_minimum is None or self.pending_maximum is None:  # pragma: no cover
             raise RuntimeError("missing statistics for a non-empty shard")
-        statistics["minimum"] = (
-            self.pending_minimum
-            if statistics["minimum"] is None
-            else min(float(statistics["minimum"]), self.pending_minimum)
+        payload = {
+            self.channel: channel,
+            "formal_charge": formal_charge,
+            "electron_count": electron_count,
+            "integrated_charge": integrated_charge,
+            "canonical_smiles": self.canonical_smiles,
+            "molecule_key": self.molecule_keys,
+            "source_id": self.source_ids,
+        }
+        self._inflight_transaction = {
+            "shard_name": shard_name,
+            "records": self.pending_records,
+            "failed": self.pending_failed,
+            "duplicates": self.pending_duplicates,
+            "source_offset": self.pending_source_offset,
+            "elements": self.pending_elements,
+            "sum": self.pending_sum,
+            "sum_of_squares": self.pending_sum_of_squares,
+            "minimum": self.pending_minimum,
+            "maximum": self.pending_maximum,
+        }
+        self.inflight_records = self.pending_records
+        keys = self.molecule_keys
+        self._write_future = self._io_executor.submit(
+            self._write_shard_files,
+            payload,
+            temporary_path,
+            shard_path,
+            keys,
         )
-        statistics["maximum"] = (
-            self.pending_maximum
-            if statistics["maximum"] is None
-            else max(float(statistics["maximum"]), self.pending_maximum)
-        )
-        self.manifest["shards"].append(
-            {"file": shard_name, "records": self.pending_records}
-        )
-        self.manifest["successful_records"] += self.pending_records
-        self.manifest["failed_records"] += self.pending_failed
-        self.manifest["duplicate_records"] += self.pending_duplicates
-        self.manifest["source_offset"] = self.pending_source_offset
-        self._write_manifest()
 
         self.channel_batches.clear()
-        self.canonical_smiles.clear()
-        self.molecule_keys.clear()
-        self.source_ids.clear()
+        self.canonical_smiles = []
+        self.molecule_keys = []
+        self.source_ids = []
         self.formal_charge_batches.clear()
         self.electron_count_batches.clear()
         self.integrated_charge_batches.clear()
@@ -317,6 +344,60 @@ class SingleChannelShardWriter:
         self.pending_sum_of_squares = 0.0
         self.pending_minimum = None
         self.pending_maximum = None
+
+    def _write_shard_files(
+        self,
+        payload: dict[str, object],
+        temporary_path: Path,
+        shard_path: Path,
+        keys: list[str],
+    ) -> None:
+        with temporary_path.open("wb", buffering=_OUTPUT_BUFFER_BYTES) as handle:
+            torch.save(payload, handle)
+        replace_file_with_retry(temporary_path, shard_path)
+        if self.deduplicate:
+            with self.keys_path.open("a", encoding="ascii", newline="\n") as handle:
+                handle.write("".join(f"{key}\n" for key in keys))
+                handle.flush()
+                os.fsync(handle.fileno())
+
+    def _finish_inflight(self) -> None:
+        if self._write_future is None or self._inflight_transaction is None:
+            return
+        self._write_future.result()
+        transaction = self._inflight_transaction
+        statistics = self.manifest["statistics"]
+        statistics["elements"] += transaction["elements"]
+        statistics["sum"] += transaction["sum"]
+        statistics["sum_of_squares"] += transaction["sum_of_squares"]
+        statistics["minimum"] = (
+            transaction["minimum"]
+            if statistics["minimum"] is None
+            else min(float(statistics["minimum"]), float(transaction["minimum"]))
+        )
+        statistics["maximum"] = (
+            transaction["maximum"]
+            if statistics["maximum"] is None
+            else max(float(statistics["maximum"]), float(transaction["maximum"]))
+        )
+        self.manifest["shards"].append(
+            {"file": transaction["shard_name"], "records": transaction["records"]}
+        )
+        self.manifest["successful_records"] += transaction["records"]
+        self.manifest["failed_records"] += transaction["failed"]
+        self.manifest["duplicate_records"] += transaction["duplicates"]
+        self.manifest["source_offset"] = transaction["source_offset"]
+        self._write_manifest()
+        self.inflight_records = 0
+        self._write_future = None
+        self._inflight_transaction = None
+
+    def finish(self) -> None:
+        """Wait for the final shard and close the background writer."""
+        try:
+            self._finish_inflight()
+        finally:
+            self._io_executor.shutdown(wait=True)
 
     def _write_manifest(self) -> None:
         temporary_path = self.manifest_path.with_suffix(".json.tmp")
@@ -339,7 +420,6 @@ def compile_record(
 def save_validation_previews(
     output_dir: Path,
     result: ExpectedChargeTrainingBatchResult,
-    molecules: list[CompiledExpectedChargeMolecule],
     source_ids: list[str],
     remaining: int,
     start_index: int,
@@ -353,7 +433,7 @@ def save_validation_previews(
 
     preview_dir = output_dir / "validation_previews"
     preview_dir.mkdir(exist_ok=True)
-    count = min(remaining, len(molecules))
+    count = min(remaining, len(result.canonical_smiles))
     for index in range(count):
         image = result.channel[index, 0].detach().float().cpu()
         if result.channel_name == "field":
@@ -368,10 +448,6 @@ def save_validation_previews(
             vmin=-limit,
             vmax=limit,
             extent=(-1.0, 1.0, -1.0, 1.0),
-        )
-        coordinates = molecules[index].coordinates
-        axis.scatter(
-            coordinates[:, 0], coordinates[:, 1], marker="x", s=12, color="black"
         )
         axis.set_title(
             f"{source_ids[index]} | {result.channel_name}\n"
@@ -467,7 +543,6 @@ def main() -> None:
                 preview_count += save_validation_previews(
                     args.output,
                     result,
-                    molecules,
                     source_ids,
                     args.validation_previews - preview_count,
                     preview_count,
@@ -497,6 +572,7 @@ def main() -> None:
 
     writer.pending_source_offset = source_offset
     writer.flush()
+    writer.finish()
     elapsed = time.perf_counter() - started
     processed = source_offset - start_offset
     print(

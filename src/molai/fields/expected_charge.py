@@ -364,26 +364,11 @@ class ExpectedCharge2D:
                 molecule = optimized_molecule
                 layout_score = optimized_score
         coordinates = self._coordinates(molecule)
-        heavy_mask = np.asarray(
-            [atom.GetAtomicNum() > 1 for atom in molecule.GetAtoms()], dtype=bool
-        )
-        center_coordinates = coordinates[heavy_mask] if heavy_mask.any() else coordinates
-        coordinates -= center_coordinates.mean(axis=0, keepdims=True)
+        coordinates -= coordinates.mean(axis=0, keepdims=True)
         lengths = [
             np.linalg.norm(coordinates[bond.GetBeginAtomIdx()] - coordinates[bond.GetEndAtomIdx()])
             for bond in molecule.GetBonds()
-            if (
-                molecule.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomicNum() > 1
-                and molecule.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomicNum() > 1
-            )
         ]
-        if not lengths:
-            lengths = [
-                np.linalg.norm(
-                    coordinates[bond.GetBeginAtomIdx()] - coordinates[bond.GetEndAtomIdx()]
-                )
-                for bond in molecule.GetBonds()
-            ]
         median_length = max(float(np.median(lengths)), 1e-6) if lengths else 1.0
         max_abs = max(float(np.abs(coordinates).max(initial=0.0)), 1e-6)
         scale = min(
@@ -763,28 +748,16 @@ class ExpectedCharge2D:
         nuclear_owners, nuclear_primitives = self._flatten_primitives(
             compiled, "nuclear_density"
         )
-        signed_charge = torch.zeros(
-            batch_size, self.config.resolution, self.config.resolution, device=self.device
+        nuclear_density = self._rasterize_gaussians(
+            batch_size, nuclear_owners, nuclear_primitives
         )
-        self._accumulate_gaussians(
-            signed_charge, nuclear_owners, nuclear_primitives
-        )
-        electron_owners: list[int] = []
-        electron_primitives: list[_Elliptical] = []
-        for owner, molecule in enumerate(compiled):
-            for primitives in (
-                molecule.bond_density,
-                molecule.lone_pair_density,
-                molecule.delocalized_density,
-            ):
-                electron_owners.extend([owner] * len(primitives))
-                electron_primitives.extend(primitives)
-        self._accumulate_ellipticals(
-            signed_charge,
-            electron_owners,
-            electron_primitives,
-            coefficient=-1.0,
-        )
+        electron_density = torch.zeros_like(nuclear_density)
+        for attribute in ("bond_density", "lone_pair_density", "delocalized_density"):
+            owners, primitives = self._flatten_primitives(compiled, attribute)
+            electron_density.add_(
+                self._rasterize_ellipticals(batch_size, owners, primitives)
+            )
+        signed_charge = nuclear_density - electron_density
         integrated_charge = signed_charge.sum(dim=(-2, -1)) * self.pixel_area
         if channel == "field":
             output = signed_charge / (self.config.softsign_scale + signed_charge.abs())
