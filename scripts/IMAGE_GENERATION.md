@@ -89,14 +89,17 @@ uv run python scripts/generate_expected_charge_dataset.py `
   --resolution 128 `
   --batch-size 128 `
   --shard-size 4096 `
-  --workers 4 `
+  --workers 16 `
   --validation-previews 8 `
   --device cuda
 ```
 
-`--batch-size`를 생략하면 CUDA는 128, CPU는 32를 사용한다. `--workers`의 기본값은
-CPU 수에 따라 정해지며 최대 4다. 실제 최적값은 분자 크기, 저장 장치, CPU와 GPU에
-따라 달라질 수 있으므로 대표 데이터로 측정해야 한다.
+`--batch-size`를 생략하면 CUDA는 128, CPU는 32를 사용한다. SMILES 전처리는 CUDA
+상태를 상속하지 않는 spawn 기반 프로세스 풀에서 실행된다. `--workers`의 기본값은
+물리 코어 추정치에 따라 정해지며 최대 16이다. `--compile-backend thread`로 기존
+스레드 경로를 선택할 수 있고 `--compile-chunk-size`로 프로세스 IPC 단위를 조절한다.
+실제 최적값은 분자 크기, 저장 장치, CPU와 GPU에 따라 달라질 수 있으므로 대표
+데이터로 측정해야 한다.
 
 지원 입력:
 

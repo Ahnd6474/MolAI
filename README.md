@@ -111,8 +111,8 @@ successful and failed records, convergence state, iteration count, final change,
 charge, and solver-specific energy diagnostics.
 
 For large graph-derived pretraining sets, `scripts/generate_expected_charge_dataset.py`
-uses a lower-memory single-channel path. It streams the input, prepares molecules in a CPU
-thread pool, rasterizes full batches on the selected Torch device, and writes resumable
+uses a lower-memory single-channel path. It streams the input, prepares molecules in a
+spawn-based CPU process pool, rasterizes full batches on the selected Torch device, and writes resumable
 float16 shards. The default target is the electrostatic potential `G * Q` channel with
 shape `[molecules, 1, resolution, resolution]`; the bounded `field` and raw
 `signed_charge` remain selectable with `--channel`. Raw tensors never contain a color map;
@@ -137,9 +137,15 @@ uv run python scripts/generate_expected_charge_dataset.py `
   --resolution 128 `
   --batch-size 128 `
   --shard-size 4096 `
+  --workers 16 `
   --validation-previews 8 `
   --device cuda
 ```
+
+The process-pool backend is CUDA-safe and uses multiple physical CPU cores for RDKit layout
+and charge assignment. The automatic worker count is capped at 16; use
+`--compile-backend thread` for low-memory or debugging runs, and tune process IPC batching
+with `--compile-chunk-size` when benchmarking a different host.
 
 The reader supports Parquet, CSV/CSV.GZ, SMI/SMILES/TXT (optionally GZip-compressed), and
 SDF/SDF.GZ. For tabular files, use `--smiles-column` and `--id-column` to match the source

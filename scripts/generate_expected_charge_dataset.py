@@ -6,10 +6,13 @@ import argparse
 import hashlib
 import itertools
 import json
+import multiprocessing
 import os
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
+from typing import Callable, Iterable
 
 import torch
 from rdkit import RDLogger
@@ -24,6 +27,13 @@ from molai.fields import (
 )
 
 _OUTPUT_BUFFER_BYTES = 16 * 1024 * 1024
+_COMPILE_WORKER_RENDERER: ExpectedCharge2D | None = None
+
+CompileResult = tuple[
+    StructureRecord,
+    CompiledExpectedChargeMolecule | None,
+    str | None,
+]
 
 
 def replace_file_with_retry(source: Path, destination: Path, attempts: int = 6) -> None:
@@ -51,10 +61,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--softsign-scale", type=float, default=32.0)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--shard-size", type=int, default=4096)
+    parser.add_argument("--workers", type=int)
     parser.add_argument(
-        "--workers",
+        "--compile-backend",
+        choices=("process", "thread"),
+        default="process",
+        help="CPU molecule compilation backend; process uses multiple CPU cores",
+    )
+    parser.add_argument(
+        "--compile-chunk-size",
         type=int,
-        default=min(4, max(1, (os.cpu_count() or 4) // 4)),
+        default=4,
+        help="Records sent to each process-pool task chunk",
     )
     parser.add_argument("--dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--smiles-column", default="canonical_smiles")
@@ -410,11 +428,37 @@ class SingleChannelShardWriter:
 def compile_record(
     renderer: ExpectedCharge2D,
     record: StructureRecord,
-) -> tuple[StructureRecord, CompiledExpectedChargeMolecule | None, str | None]:
+) -> CompileResult:
     try:
         return record, renderer.compile_molecule(record.smiles), None
     except (RuntimeError, ValueError) as error:
         return record, None, str(error)
+
+
+def initialize_compile_worker(config: ExpectedChargeConfig) -> None:
+    """Create one CPU-only molecule compiler in each spawned worker process."""
+    global _COMPILE_WORKER_RENDERER
+    torch.set_num_threads(1)
+    RDLogger.DisableLog("rdApp.warning")
+    RDLogger.DisableLog("rdApp.error")
+    _COMPILE_WORKER_RENDERER = ExpectedCharge2D(config, "cpu")
+
+
+def compile_record_in_worker(record: StructureRecord) -> CompileResult:
+    """Compile one record using process-local state initialized once per worker."""
+    if _COMPILE_WORKER_RENDERER is None:  # pragma: no cover - defensive worker guard
+        raise RuntimeError("compile worker was not initialized")
+    return compile_record(_COMPILE_WORKER_RENDERER, record)
+
+
+def compile_batch(
+    executor: ProcessPoolExecutor | ThreadPoolExecutor,
+    compile_one: Callable[[StructureRecord], CompileResult],
+    batch: list[StructureRecord],
+    chunk_size: int,
+) -> Iterable[CompileResult]:
+    """Submit a batch while preserving source order and bounding queued work."""
+    return executor.map(compile_one, batch, chunksize=chunk_size)
 
 
 def save_validation_previews(
@@ -462,8 +506,11 @@ def save_validation_previews(
 
 def main() -> None:
     args = parse_args()
-    if args.shard_size < 1 or args.workers < 1:
-        raise ValueError("shard size and worker count must be positive")
+    if args.workers is None:
+        physical_core_estimate = max(1, (os.cpu_count() or 4) // 2)
+        args.workers = min(16, physical_core_estimate)
+    if args.shard_size < 1 or args.workers < 1 or args.compile_chunk_size < 1:
+        raise ValueError("shard size, worker count, and compile chunk size must be positive")
     device = torch.device(args.device)
     batch_size = args.batch_size or (128 if device.type == "cuda" else 32)
     dtype = torch.float16 if args.dtype == "float16" else torch.float32
@@ -505,22 +552,40 @@ def main() -> None:
     started = time.perf_counter()
     next_progress = source_offset + args.progress_every
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    if args.compile_backend == "process":
+        executor: ProcessPoolExecutor | ThreadPoolExecutor = ProcessPoolExecutor(
+            max_workers=args.workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=initialize_compile_worker,
+            initargs=(config,),
+        )
+        compile_one = compile_record_in_worker
+    else:
+        executor = ThreadPoolExecutor(
+            max_workers=args.workers,
+            thread_name_prefix="molai-molecule-compiler",
+        )
+        compile_one = partial(compile_record, renderer)
+
+    print(
+        f"Compile backend={args.compile_backend} workers={args.workers} "
+        f"chunk_size={args.compile_chunk_size}"
+    )
+    with executor:
         batch = list(itertools.islice(records, batch_size))
-        futures = [
-            executor.submit(compile_record, renderer, record) for record in batch
-        ]
+        compiled_batch = compile_batch(
+            executor, compile_one, batch, args.compile_chunk_size
+        )
         while batch:
-            compiled_results = [future.result() for future in futures]
+            compiled_results = list(compiled_batch)
             if device.type == "cuda":
                 next_batch = list(itertools.islice(records, batch_size))
-                next_futures = [
-                    executor.submit(compile_record, renderer, record)
-                    for record in next_batch
-                ]
+                next_compiled_batch = compile_batch(
+                    executor, compile_one, next_batch, args.compile_chunk_size
+                )
             else:
                 next_batch = []
-                next_futures = []
+                next_compiled_batch = iter(())
             source_offset += len(batch)
             failures = 0
             molecules: list[CompiledExpectedChargeMolecule] = []
@@ -563,12 +628,11 @@ def main() -> None:
 
             if device.type != "cuda":
                 next_batch = list(itertools.islice(records, batch_size))
-                next_futures = [
-                    executor.submit(compile_record, renderer, record)
-                    for record in next_batch
-                ]
+                next_compiled_batch = compile_batch(
+                    executor, compile_one, next_batch, args.compile_chunk_size
+                )
             batch = next_batch
-            futures = next_futures
+            compiled_batch = next_compiled_batch
 
     writer.pending_source_offset = source_offset
     writer.flush()
