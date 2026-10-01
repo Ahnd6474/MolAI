@@ -25,7 +25,7 @@ from molai.data import (
     collate_spectrum_field_batch,
     open_field_dataset,
 )
-from molai.models.bridge import GeometricVESchedule, VPSchedule
+from molai.models.bridge import CosineVPSchedule, GeometricVESchedule, VPSchedule
 from molai.models.cloud import MolecularFieldCloud
 from molai.models.condition import SmilesConditionEncoder, SpectrumConditionEncoder
 from molai.models.losses import FullBandEnergyDistance
@@ -93,8 +93,26 @@ def _training_value(args: argparse.Namespace, config: dict, name: str) -> object
 
 
 def _make_schedule(
-    manifest: dict[str, object], device: torch.device
+    manifest: dict[str, object], config: dict, device: torch.device
 ) -> VPSchedule | GeometricVESchedule:
+    training_schedule = config["cloud_matching"].get("noise_schedule")
+    if isinstance(training_schedule, dict):
+        schedule_type = str(training_schedule.get("type", "")).lower()
+        if schedule_type == "cosine_vp":
+            return CosineVPSchedule(
+                levels=int(training_schedule.get("levels", 64)),
+                offset=float(training_schedule.get("cosine_offset", 0.008)),
+                noise_scale=float(training_schedule.get("noise_scale", 1.0)),
+                device=device,
+            )
+        if schedule_type != "geometric_ve":
+            raise ValueError(f"unsupported cloud noise schedule: {schedule_type}")
+        return GeometricVESchedule(
+            levels=int(training_schedule["levels"]),
+            sigma_min=float(training_schedule["sigma_min"]),
+            sigma_max=float(training_schedule["sigma_max"]),
+            device=device,
+        )
     noise_config = manifest.get("noise_schedule")
     if isinstance(noise_config, dict):
         return GeometricVESchedule(
@@ -126,7 +144,12 @@ def _sample_transition(
             current_levels=current_levels,
             **options,
         )
-    return schedule.sample_training_batch(clean, samples, **options)
+    return schedule.sample_training_batch(
+        clean,
+        samples,
+        current_levels=current_levels,
+        **options,
+    )
 
 
 def _condition_from_batch(
@@ -167,11 +190,11 @@ def _triptych(clean: Tensor, current: Tensor, predicted: Tensor) -> Tensor:
     for actual, noisy, output in zip(clean, current, predicted, strict=True):
         values = torch.cat((actual.flatten(), noisy.flatten(), output.flatten())).abs()
         scale = torch.quantile(values, 0.995).clamp_min(1e-6)
-        panels = [((image / scale).clamp(-1.0, 1.0) + 1.0) * 0.5 for image in (actual, noisy, output)]
+        panels = [
+            ((image / scale).clamp(-1.0, 1.0) + 1.0) * 0.5 for image in (actual, noisy, output)
+        ]
         separator = torch.ones(1, actual.shape[-2], 3)
-        triptychs.append(
-            torch.cat((panels[0], separator, panels[1], separator, panels[2]), dim=-1)
-        )
+        triptychs.append(torch.cat((panels[0], separator, panels[1], separator, panels[2]), dim=-1))
     return torch.stack(triptychs)
 
 
@@ -240,11 +263,14 @@ def _validate(
     total = 0.0
     count = 0
     images: Tensor | None = None
+    image_tag = "samples/actual_input_output"
     try:
         for batch in loader:
             clean = batch["field"].to(device, non_blocking=True)
             levels = batch.get("noise_level")
-            current_levels = levels.to(device, non_blocking=True) if isinstance(levels, Tensor) else None
+            current_levels = (
+                levels.to(device, non_blocking=True) if isinstance(levels, Tensor) else None
+            )
             transition = _sample_transition(
                 schedule, clean, samples, config, current_levels=current_levels
             )
@@ -255,7 +281,36 @@ def _validate(
             total += float(loss) * clean.shape[0]
             count += clean.shape[0]
             if images is None:
-                images = _triptych(clean[:4], transition.current[:4], predicted[:4, 0])
+                preview_levels = config["cloud_matching"].get(
+                    "validation_preview_levels", [8, 24, 48, 64]
+                )
+                preview_count = min(len(preview_levels), clean.shape[0])
+                preview_level_tensor = torch.tensor(
+                    preview_levels[:preview_count], device=device, dtype=torch.long
+                )
+                preview_transition = _sample_transition(
+                    schedule,
+                    clean[:preview_count],
+                    samples,
+                    config,
+                    current_levels=preview_level_tensor,
+                )
+                with torch.autocast(
+                    device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+                ):
+                    preview_predicted, _, _ = cloud_runner(
+                        preview_transition.current,
+                        condition[:preview_count],
+                        samples=samples,
+                    )
+                images = _triptych(
+                    clean[:preview_count],
+                    preview_transition.current,
+                    preview_predicted[:, 0],
+                )
+                image_tag = "samples/vp_" + "_".join(
+                    f"L{int(level):02d}" for level in preview_levels[:preview_count]
+                )
     finally:
         torch.random.set_rng_state(cpu_rng)
         if cuda_rng is not None:
@@ -263,7 +318,7 @@ def _validate(
     mean = _distributed_mean(total, count, device)
     if writer is not None and images is not None:
         writer.add_images(
-            "samples/actual_input_output",
+            image_tag,
             images,
             epoch + 1,
             dataformats="NCHW",
@@ -374,7 +429,6 @@ def main() -> None:
         cvt_output_sizes=[int(value) for value in model_config["cvt_output_sizes"]],
         condition_gate_init=float(model_config["condition_gate_init"]),
         max_resolution=int(model_config["max_resolution"]),
-        max_residual=float(model_config["max_residual"]),
         noise_energy_min=float(model_config["noise_energy_min"]),
         noise_energy_init=float(model_config["noise_energy_init"]),
         noise_amplitude_max=float(model_config["noise_amplitude_max"]),
@@ -427,7 +481,7 @@ def main() -> None:
         start_epoch = int(checkpoint["epoch"]) + 1
         global_step = int(checkpoint["global_step"])
 
-    schedule = _make_schedule(dataset.manifest, device)
+    schedule = _make_schedule(dataset.manifest, config, device)
     cloud_samples = int(config["cloud_matching"]["samples"])
     cloud_loss = FullBandEnergyDistance(
         levels=int(config["cloud_matching"]["full_band_levels"]),
@@ -485,7 +539,9 @@ def main() -> None:
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
             levels = batch.get("noise_level")
-            current_levels = levels.to(device, non_blocking=True) if isinstance(levels, Tensor) else None
+            current_levels = (
+                levels.to(device, non_blocking=True) if isinstance(levels, Tensor) else None
+            )
             transition = _sample_transition(
                 schedule, clean, cloud_samples, config, current_levels=current_levels
             )
@@ -532,9 +588,7 @@ def main() -> None:
                     peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
                     peak_reserved = torch.cuda.max_memory_reserved(device) / 2**30
                     writer.add_scalar("batch/gpu_peak_memory_gib", peak_memory, global_step)
-                    writer.add_scalar(
-                        "batch/gpu_peak_reserved_gib", peak_reserved, global_step
-                    )
+                    writer.add_scalar("batch/gpu_peak_reserved_gib", peak_reserved, global_step)
                 if "spectrum_to_molecule" in batch:
                     writer.add_scalar(
                         "batch/spectra",

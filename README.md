@@ -173,9 +173,13 @@ incompatible fields from being mixed silently.
 
 ### 4. Cloud Matching pretraining
 
-The pretraining path corrupts each clean field with a variance-preserving diffusion
-schedule. For a randomly selected noisy state, it analytically samples several posterior
-targets at an earlier noise level, including clean-field jumps. The model predicts an
+The pretraining path corrupts each clean field with a 64-level cosine
+variance-preserving schedule. Its terminal level has zero clean-field coefficient and is
+therefore pure Gaussian noise, rather than an additive-noise image that still exposes the
+large nuclear peaks. Because ESP remains in raw units, the Gaussian term is scaled by the
+dataset RMS instead of assuming unit-variance images. For a randomly selected noisy state,
+it analytically samples several
+posterior targets eight levels earlier, including clean-field jumps. The model predicts an
 empirical cloud of possible corrections rather than a single deterministic image.
 
 The generator keeps the full input resolution; it reduces feature width instead of
@@ -187,7 +191,9 @@ compress only the attention context to 8x8, 4x4, and 2x2 grids. Thus a 128x128 f
 64-slot random memory is injected before the CvT refinement stack, with a learned spatial
 noise energy controlling per-pixel stochasticity. The training objective is a stride-free,
 multi-band energy distance between predicted and target correction clouds, plus an optional
-autoregressive SMILES loss.
+autoregressive SMILES loss. The native-grid output head emits an unrestricted raw-ESP
+residual; a bounded tanh residual cannot reconstruct the nuclear range from the pure-noise
+endpoint.
 
 The default Kohn-Sham grid is `192 x 192`. `max_resolution: 256` reserves space for later
 resolution ablations; it does not resize the input automatically.
@@ -349,9 +355,9 @@ converged.
 
 ### Pretrain the field model
 
-Create a zero-copy noisy view of the raw ESP shards. The view keeps the raw
-potential untouched and spaces 64 Gaussian noise magnitudes geometrically from
-1% to 100% of the dataset RMS:
+Create a zero-copy view of the raw ESP shards. The view keeps the raw potential untouched
+and records scale statistics; corruption is sampled online from the cosine VP schedule in
+`configs/model.yaml` so every molecule receives a new level each epoch:
 
 ```bash
 uv run python scripts/prepare_noise_dataset.py \

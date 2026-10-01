@@ -1,7 +1,7 @@
 import torch
 
 from molai.models.attention import MultiscaleCvTAttention2d
-from molai.models.bridge import GeometricVESchedule, VPSchedule
+from molai.models.bridge import CosineVPSchedule, GeometricVESchedule, VPSchedule
 from molai.models.cloud import MolecularCloudModel, MolecularFieldCloud
 from molai.models.condition import (
     ExponentialDistanceConvBlock,
@@ -90,6 +90,58 @@ def test_geometric_noise_bridge_uses_requested_levels() -> None:
     assert bridge.current[-1].std() > bridge.current[0].std() * 20
 
 
+def test_cosine_vp_terminal_level_contains_no_clean_signal() -> None:
+    schedule = CosineVPSchedule(levels=64, noise_scale=3.5)
+    clean = torch.randn(2, 1, 32, 32) * 4.0
+    terminal = torch.full((2,), 64)
+
+    torch.manual_seed(11)
+    first = schedule.sample_training_batch(
+        clean,
+        samples=2,
+        current_levels=terminal,
+        answer_jump=8,
+        clean_answer_probability=0.0,
+    )
+    torch.manual_seed(11)
+    second = schedule.sample_training_batch(
+        clean * 3.0,
+        samples=2,
+        current_levels=terminal,
+        answer_jump=8,
+        clean_answer_probability=0.0,
+    )
+
+    assert float(schedule.alpha_bar[0]) == 1.0
+    assert float(schedule.alpha_bar[-1]) == 0.0
+    torch.testing.assert_close(first.current, second.current)
+    torch.testing.assert_close(first.current.std(), torch.tensor(3.5), atol=0.12, rtol=0.0)
+    torch.testing.assert_close(first.answer_levels, torch.full((2,), 56))
+
+
+def test_cloud_raw_residual_is_not_limited_to_legacy_range() -> None:
+    model = MolecularFieldCloud(
+        condition_dim=32,
+        dim=32,
+        heads=4,
+        condition_cross_depth=1,
+        noise_cross_depth=1,
+        noise_token_count=8,
+        refine_depth=1,
+        max_resolution=16,
+        gradient_checkpointing=False,
+    ).eval()
+    torch.nn.init.zeros_(model.output_head.weight)
+    torch.nn.init.constant_(model.output_head.bias, 12.0)
+    fields, _, _ = model(
+        torch.zeros(1, 1, 8, 8),
+        torch.zeros(1, 32),
+        samples=1,
+    )
+
+    torch.testing.assert_close(fields, torch.full_like(fields, 12.0))
+
+
 def test_reused_band_pyramid_matches_direct_error_filtering() -> None:
     torch.manual_seed(4)
     first = torch.randn(3, 1, 16, 16)
@@ -99,12 +151,8 @@ def test_reused_band_pyramid_matches_direct_error_filtering() -> None:
     kernel_1d = first.new_tensor([1.0, 4.0, 6.0, 4.0, 1.0]) / 16.0
     kernel = torch.outer(kernel_1d, kernel_1d)[None, None]
     for level in range(3):
-        low = torch.nn.functional.conv2d(
-            error, kernel, padding=2 * 2**level, dilation=2**level
-        )
-        direct_distances.append(
-            torch.sqrt((error - low).square() + 1e-6).mean(dim=(1, 2, 3))
-        )
+        low = torch.nn.functional.conv2d(error, kernel, padding=2 * 2**level, dilation=2**level)
+        direct_distances.append(torch.sqrt((error - low).square() + 1e-6).mean(dim=(1, 2, 3)))
         error = low
     direct_distances.append(torch.sqrt(error.square() + 1e-6).mean(dim=(1, 2, 3)))
     expected = torch.stack(direct_distances).mean(dim=0)
@@ -152,10 +200,7 @@ def test_cloud_uses_one_random_attention_before_cvt_refinement() -> None:
 
     assert model.noise_attention.random_dim == 32
     assert len(model.refine_blocks) == 2
-    assert all(
-        block.attention.pooled_token_count(16, 16) == 84
-        for block in model.refine_blocks
-    )
+    assert all(block.attention.pooled_token_count(16, 16) == 84 for block in model.refine_blocks)
 
 
 def test_smiles_tokenizer_round_trip() -> None:
@@ -317,8 +362,7 @@ def test_spectrum_condition_attention_uses_all_peak_chunks() -> None:
         peak_chunk_size=4,
     ).eval()
     peaks = torch.tensor(
-        [[[[100.0, 1.0], [150.0, 0.8], [200.0, 0.6], [250.0, 0.4],
-           [300.0, 0.01], [350.0, 0.001]]]]
+        [[[[100.0, 1.0], [150.0, 0.8], [200.0, 0.6], [250.0, 0.4], [300.0, 0.01], [350.0, 0.001]]]]
     )
     peak_mask = torch.ones(1, 1, 6, dtype=torch.bool)
     spectrum_mask = torch.ones(1, 1, dtype=torch.bool)

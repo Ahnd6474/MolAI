@@ -27,11 +27,13 @@ class VPSchedule:
     ) -> None:
         beta = torch.linspace(beta_start, beta_end, steps, device=device)
         self.alpha_bar = torch.cumprod(1.0 - beta, dim=0)
+        self.noise_scale = 1.0
 
     def sample_training_batch(
         self,
         clean: Tensor,
         samples: int,
+        current_levels: Tensor | None = None,
         answer_jump: int = 10,
         clean_answer_probability: float = 0.5,
     ) -> BridgeBatch:
@@ -39,15 +41,23 @@ class VPSchedule:
 
         batch = clean.shape[0]
         device = clean.device
-        current_levels = torch.randint(1, len(self.alpha_bar), (batch,), device=device)
-        goal_levels = torch.floor(torch.rand(batch, device=device) * current_levels.float()).long()
-        answer_levels = (goal_levels - answer_jump).clamp_min(0)
+        if current_levels is None:
+            current_levels = torch.randint(1, len(self.alpha_bar), (batch,), device=device)
+        else:
+            current_levels = current_levels.to(device=device, dtype=torch.long)
+            if current_levels.shape != (batch,):
+                raise ValueError("current_levels must have shape [B]")
+            if bool(((current_levels < 1) | (current_levels >= len(self.alpha_bar))).any()):
+                raise ValueError("current_levels are outside the configured noise schedule")
+        answer_levels = (current_levels - answer_jump).clamp_min(0)
         force_clean = torch.rand(batch, device=device) < clean_answer_probability
         answer_levels = torch.where(force_clean, torch.zeros_like(answer_levels), answer_levels)
 
         alpha_s = self.alpha_bar[current_levels].view(batch, 1, 1, 1)
         current_noise = torch.randn_like(clean)
-        current = alpha_s.sqrt() * clean + (1.0 - alpha_s).sqrt() * current_noise
+        current = alpha_s.sqrt() * clean + (
+            self.noise_scale * (1.0 - alpha_s).sqrt() * current_noise
+        )
 
         alpha_a = self.alpha_bar[answer_levels].clone()
         alpha_a = torch.where(answer_levels.eq(0), torch.ones_like(alpha_a), alpha_a)
@@ -70,13 +80,39 @@ class VPSchedule:
             device=device,
             dtype=clean.dtype,
         )
-        target_cloud = mean + variance.sqrt().view(shape) * target_noise
+        target_cloud = mean + self.noise_scale * variance.sqrt().view(shape) * target_noise
         target_cloud = torch.where(
             answer_levels.view(batch, 1, 1, 1, 1).eq(0),
             clean[:, None],
             target_cloud,
         )
         return BridgeBatch(current, target_cloud, current_levels, answer_levels)
+
+
+class CosineVPSchedule(VPSchedule):
+    """Cosine variance-preserving schedule with a pure-noise terminal level."""
+
+    def __init__(
+        self,
+        levels: int = 64,
+        offset: float = 0.008,
+        noise_scale: float = 1.0,
+        device: torch.device | str = "cpu",
+    ) -> None:
+        if levels < 2:
+            raise ValueError("levels must be at least two")
+        if not 0.0 <= offset < 1.0:
+            raise ValueError("cosine offset must lie in [0, 1)")
+        if noise_scale <= 0.0:
+            raise ValueError("noise_scale must be positive")
+        level = torch.arange(levels + 1, device=device, dtype=torch.float32)
+        angle = ((level / levels + offset) / (1.0 + offset)) * (math.pi / 2.0)
+        alpha_bar = angle.cos().square()
+        alpha_bar = alpha_bar / alpha_bar[0]
+        alpha_bar[0] = 1.0
+        alpha_bar[-1] = 0.0
+        self.alpha_bar = alpha_bar
+        self.noise_scale = float(noise_scale)
 
 
 class GeometricVESchedule:

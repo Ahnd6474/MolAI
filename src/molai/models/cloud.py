@@ -52,7 +52,6 @@ class MolecularFieldCloud(nn.Module):
         cvt_output_sizes: list[int] | tuple[int, ...] = (8, 4, 2),
         condition_gate_init: float = 0.5,
         max_resolution: int = 256,
-        max_residual: float = 2.0,
         noise_energy_min: float = 1e-4,
         noise_energy_init: float = 0.1,
         noise_amplitude_max: float = 8.0,
@@ -72,7 +71,6 @@ class MolecularFieldCloud(nn.Module):
         self.field_channels = field_channels
         self.dim = dim
         self.noise_token_dim = dim if noise_token_dim is None else noise_token_dim
-        self.max_residual = max_residual
         self.noise_energy_min = noise_energy_min
         self.noise_amplitude_max = noise_amplitude_max
         self.noise_token_count = noise_token_count
@@ -207,7 +205,7 @@ class MolecularFieldCloud(nn.Module):
         for block in self.refine_blocks:
             tokens = self._run(block, tokens)
 
-        residual = self.max_residual * torch.tanh(self.output_head(self.output_norm(tokens)))
+        residual = self.output_head(self.output_norm(tokens))
         residual = residual.permute(0, 3, 1, 2)
         expanded_current = current[:, None].expand(-1, samples, -1, -1, -1)
         fields = expanded_current.reshape(batch * samples, *current.shape[1:]) + residual
