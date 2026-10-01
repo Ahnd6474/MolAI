@@ -44,7 +44,7 @@ spectrum encoder because both produce the same fixed-width conditioning vector.
   pseudo-DFT solver, and a higher-cost 2D valence Kohn-Sham solver.
 - Deterministic RDKit-based molecular standardization and 2D coordinate normalization.
 - Resumable, sharded field generation with convergence and charge-conservation metadata.
-- A full-resolution conditional Cloud Matching architecture with local and axial attention.
+- A full-resolution conditional Cloud Matching architecture with CvT-style reduced-K/V attention.
 - SMILES and multi-spectrum condition encoders with a shared conditioning interface.
 - An autoregressive SMILES head and a smaller image-to-SMILES probe for measuring how much
   structural information survives in a field.
@@ -179,10 +179,13 @@ targets at an earlier noise level, including clean-field jumps. The model predic
 empirical cloud of possible corrections rather than a single deterministic image.
 
 The generator keeps the full input resolution; it reduces feature width instead of
-patchifying or downsampling the field. A low-rank row/column condition plane injects the
-conditioning vector, while shifted local-window, row-axial, and column-axial attention
-propagate information without quadratic global image attention. A learned spatial noise
-energy controls per-pixel stochasticity. The training objective is a stride-free,
+patchifying or downsampling the field. A 3x3 convolutional stem and gated depthwise local
+refinement preserve one query per pixel. A low-rank row/column plane lifts the spectrum
+conditioning vector to the image grid; learned depthwise 3x3, 5x5, and 7x7 projections then
+compress only the attention context to 8x8, 4x4, and 2x2 grids. Thus a 128x128 field keeps
+16,384 output-aligned queries but uses only 84 multiscale K/V tokens per CvT block. One
+64-slot random memory is injected before the CvT refinement stack, with a learned spatial
+noise energy controlling per-pixel stochasticity. The training objective is a stride-free,
 multi-band energy distance between predicted and target correction clouds, plus an optional
 autoregressive SMILES loss.
 

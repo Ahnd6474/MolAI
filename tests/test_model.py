@@ -1,5 +1,6 @@
 import torch
 
+from molai.models.attention import MultiscaleCvTAttention2d
 from molai.models.bridge import GeometricVESchedule, VPSchedule
 from molai.models.cloud import MolecularCloudModel, MolecularFieldCloud
 from molai.models.condition import (
@@ -38,6 +39,24 @@ def test_full_resolution_cloud_forward_and_backward() -> None:
     assert output.smiles_logits is not None
     assert output.smiles_logits.shape == (2, 2, 12, 16)
     output.fields.mean().backward()
+
+
+def test_cvt_attention_keeps_queries_and_compresses_only_context() -> None:
+    attention = MultiscaleCvTAttention2d(
+        dim=32,
+        heads=4,
+        kernel_sizes=(3, 5, 7),
+        output_sizes=(8, 4, 2),
+    )
+    query = torch.randn(2, 16, 16, 32, requires_grad=True)
+    context = torch.randn(2, 16, 16, 32)
+    pooled = attention.pool_context(context)
+    result = attention(query, context)
+
+    assert pooled.shape == (2, 84, 32)
+    assert result.shape == query.shape
+    result.square().mean().backward()
+    assert query.grad is not None
 
 
 def test_bridge_and_energy_distance() -> None:
@@ -116,6 +135,27 @@ def test_noise_token_cloud_is_deterministic_and_sample_independent() -> None:
 
     torch.testing.assert_close(first, second)
     assert not torch.allclose(first[:, 0], first[:, 1])
+
+
+def test_cloud_uses_one_random_attention_before_cvt_refinement() -> None:
+    model = MolecularFieldCloud(
+        condition_dim=32,
+        dim=32,
+        heads=4,
+        condition_cross_depth=1,
+        noise_cross_depth=1,
+        noise_token_count=8,
+        refine_depth=2,
+        max_resolution=16,
+        gradient_checkpointing=False,
+    )
+
+    assert model.noise_attention.random_dim == 32
+    assert len(model.refine_blocks) == 2
+    assert all(
+        block.attention.pooled_token_count(16, 16) == 84
+        for block in model.refine_blocks
+    )
 
 
 def test_smiles_tokenizer_round_trip() -> None:

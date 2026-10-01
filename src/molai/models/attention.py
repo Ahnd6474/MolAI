@@ -1,8 +1,8 @@
-"""Full-resolution axial and local attention primitives.
+"""Full-resolution spatial attention primitives.
 
 The implementation is adapted from the MIT-licensed full-resolution path in
-Ahnd6474/Cloud-Matching. Spatial attention is always factorized into local,
-row-axial, or column-axial operations; no quadratic global image attention is used.
+Ahnd6474/Cloud-Matching. The primary path keeps a query at every pixel and
+convolutionally compresses only the key/value context.
 """
 
 from __future__ import annotations
@@ -172,6 +172,265 @@ class FactorizedAttention2d(nn.Module):
             need_weights=False,
         )
         return _reverse_windows(result, self.window_size, metadata, batch)
+
+
+class MultiscaleCvTAttention2d(nn.Module):
+    """Native-grid queries attending to convolutionally pooled multiscale K/V."""
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        kernel_sizes: list[int] | tuple[int, ...] = (3, 5, 7),
+        output_sizes: list[int] | tuple[int, ...] = (8, 4, 2),
+    ) -> None:
+        super().__init__()
+        kernels = tuple(int(value) for value in kernel_sizes)
+        sizes = tuple(int(value) for value in output_sizes)
+        if not kernels or len(kernels) != len(sizes):
+            raise ValueError("CvT kernel/output lists must be non-empty and equally sized")
+        if any(kernel < 1 or kernel % 2 == 0 for kernel in kernels):
+            raise ValueError("CvT kernels must be positive odd integers")
+        if any(size < 1 for size in sizes):
+            raise ValueError("CvT output sizes must be positive")
+        if dim % heads:
+            raise ValueError("dim must be divisible by heads")
+
+        self.dim = dim
+        self.kernel_sizes = kernels
+        self.output_sizes = sizes
+        self.context_convolutions = nn.ModuleList(
+            [
+                nn.Conv2d(
+                    dim,
+                    dim,
+                    kernel_size=kernel,
+                    padding=kernel // 2,
+                    groups=dim,
+                    bias=False,
+                )
+                for kernel in kernels
+            ]
+        )
+        for kernel, convolution in zip(self.kernel_sizes, self.context_convolutions, strict=True):
+            nn.init.constant_(convolution.weight, 1.0 / (kernel * kernel))
+        self.scale_embeddings = nn.Parameter(torch.zeros(len(kernels), dim))
+        nn.init.normal_(self.scale_embeddings, std=0.02)
+        self.attention = nn.MultiheadAttention(dim, heads, batch_first=True)
+
+    def pooled_token_count(self, height: int, width: int) -> int:
+        """Return the K/V sequence length for an input spatial shape."""
+
+        return sum(min(size, height) * min(size, width) for size in self.output_sizes)
+
+    def pool_context(self, context: Tensor) -> Tensor:
+        """Apply learned strided depthwise projections and concatenate scales."""
+
+        if context.ndim != 4 or context.shape[-1] != self.dim:
+            raise ValueError("context must have shape [B,H,W,D]")
+        _, height, width, _ = context.shape
+        channels_first = context.permute(0, 3, 1, 2)
+        pooled_tokens: list[Tensor] = []
+        for index, (convolution, output_size) in enumerate(
+            zip(self.context_convolutions, self.output_sizes, strict=True)
+        ):
+            pooled_height = min(output_size, height)
+            pooled_width = min(output_size, width)
+            stride_height = max(1, height // pooled_height)
+            stride_width = max(1, width // pooled_width)
+            features = F.conv2d(
+                channels_first,
+                convolution.weight,
+                bias=None,
+                stride=(stride_height, stride_width),
+                padding=convolution.padding,
+                groups=self.dim,
+            )
+            pooled = F.adaptive_avg_pool2d(features, (pooled_height, pooled_width))
+            tokens = pooled.flatten(2).transpose(1, 2)
+            pooled_tokens.append(tokens + self.scale_embeddings[index])
+        return torch.cat(pooled_tokens, dim=1)
+
+    def forward(self, query: Tensor, context: Tensor | None = None) -> Tensor:
+        context = query if context is None else context
+        if query.ndim != 4 or query.shape[-1] != self.dim:
+            raise ValueError("query must have shape [B,H,W,D]")
+        if context.ndim != 4 or context.shape[0] != query.shape[0]:
+            raise ValueError("context must have shape [B,H,W,D]")
+        batch, height, width, dim = query.shape
+        context_tokens = self.pool_context(context)
+        result, _ = self.attention(
+            query.reshape(batch, height * width, dim),
+            context_tokens,
+            context_tokens,
+            need_weights=False,
+        )
+        return result.reshape(batch, height, width, dim)
+
+
+class FullResolutionCvTEncoder(nn.Module):
+    """3x3 full-resolution stem with local refinement and reduced-K/V attention."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        dim: int,
+        heads: int,
+        kernel_sizes: list[int] | tuple[int, ...] = (3, 5, 7),
+        output_sizes: list[int] | tuple[int, ...] = (8, 4, 2),
+    ) -> None:
+        super().__init__()
+        self.input_projection = nn.Conv2d(in_channels, dim, kernel_size=3, padding=1)
+        self.local_norm = nn.LayerNorm(dim)
+        self.local_refinement = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, kernel_size=1, bias=False),
+        )
+        self.local_gate = nn.Parameter(torch.tensor(0.1))
+        self.attention_norm = nn.LayerNorm(dim)
+        self.attention = MultiscaleCvTAttention2d(dim, heads, kernel_sizes, output_sizes)
+        self.attention_gate = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, image: Tensor) -> Tensor:
+        tokens = self.input_projection(image).permute(0, 2, 3, 1)
+        local = self.local_refinement(self.local_norm(tokens).permute(0, 3, 1, 2)).permute(
+            0, 2, 3, 1
+        )
+        tokens = tokens + self.local_gate * local
+        return tokens + self.attention_gate * self.attention(self.attention_norm(tokens))
+
+
+class CvTCrossBlock(nn.Module):
+    """Fuse a full-resolution query grid with multiscale pooled context."""
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        ffn_ratio: float = 2.0,
+        gate_init: float = 0.5,
+        kernel_sizes: list[int] | tuple[int, ...] = (3, 5, 7),
+        output_sizes: list[int] | tuple[int, ...] = (8, 4, 2),
+    ) -> None:
+        super().__init__()
+        if not 0.0 < gate_init <= 1.0:
+            raise ValueError("gate_init must lie in (0, 1]")
+        hidden = max(dim, round(dim * ffn_ratio))
+        self.query_norm = nn.LayerNorm(dim)
+        self.context_norm = nn.LayerNorm(dim)
+        self.attention = MultiscaleCvTAttention2d(dim, heads, kernel_sizes, output_sizes)
+        self.gate_projection = nn.Linear(dim, 1)
+        gate_logit = 12.0 if gate_init == 1.0 else math.log(gate_init / (1.0 - gate_init))
+        nn.init.zeros_(self.gate_projection.weight)
+        nn.init.constant_(self.gate_projection.bias, gate_logit)
+        self.ff = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, query: Tensor, context: Tensor) -> Tensor:
+        update = self.attention(self.query_norm(query), self.context_norm(context))
+        query = query + torch.sigmoid(self.gate_projection(update)) * update
+        return query + self.ff(query)
+
+
+class CvTMixerBlock(nn.Module):
+    """Full-resolution self-attention with compressed multiscale K/V and FFN."""
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        ffn_ratio: float = 2.0,
+        kernel_sizes: list[int] | tuple[int, ...] = (3, 5, 7),
+        output_sizes: list[int] | tuple[int, ...] = (8, 4, 2),
+    ) -> None:
+        super().__init__()
+        hidden = max(dim, round(dim * ffn_ratio))
+        self.norm = nn.LayerNorm(dim)
+        self.attention = MultiscaleCvTAttention2d(dim, heads, kernel_sizes, output_sizes)
+        self.ff = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        tokens = tokens + self.attention(self.norm(tokens))
+        return tokens + self.ff(tokens)
+
+
+class RandomMemoryAttention(nn.Module):
+    """Inject one per-sample Gaussian memory into all full-resolution queries."""
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        random_dim: int,
+        temperature: float = 0.8,
+        gate_init: float = 0.02,
+    ) -> None:
+        super().__init__()
+        if dim % heads:
+            raise ValueError("dim must be divisible by heads")
+        if random_dim < 1 or temperature <= 0.0:
+            raise ValueError("random_dim and temperature must be positive")
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.random_dim = random_dim
+        self.temperature = temperature
+        self.query_norm = nn.LayerNorm(dim)
+        self.query_projection = nn.Linear(dim, dim, bias=False)
+        self.key_projection = nn.Linear(random_dim, dim, bias=False)
+        self.value_projection = nn.Linear(random_dim, dim, bias=False)
+        self.key_norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.value_norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.output_projection = nn.Linear(dim, dim, bias=False)
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def forward(
+        self,
+        query: Tensor,
+        random_tokens: Tensor,
+        spatial_amplitude: Tensor,
+    ) -> Tensor:
+        if query.ndim != 4 or random_tokens.ndim != 3:
+            raise ValueError("query must be [B,H,W,D] and random_tokens [B,K,R]")
+        batch, height, width, dim = query.shape
+        if (
+            dim != self.dim
+            or random_tokens.shape[0] != batch
+            or random_tokens.shape[-1] != self.random_dim
+        ):
+            raise ValueError("query/random memory dimensions do not match the module")
+        if spatial_amplitude.shape != (batch, height, width):
+            raise ValueError("spatial_amplitude must have shape [B,H,W]")
+
+        projected_query = self.query_projection(self.query_norm(query)).reshape(
+            batch, height * width, self.heads, self.head_dim
+        )
+        key = self.key_norm(self.key_projection(random_tokens)).reshape(
+            batch, random_tokens.shape[1], self.heads, self.head_dim
+        )
+        value = self.value_norm(self.value_projection(random_tokens)).reshape(
+            batch, random_tokens.shape[1], self.heads, self.head_dim
+        )
+        attended = F.scaled_dot_product_attention(
+            projected_query.permute(0, 2, 1, 3) / self.temperature,
+            key.permute(0, 2, 1, 3),
+            value.permute(0, 2, 1, 3),
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        attended = attended.permute(0, 2, 1, 3).reshape(batch, height, width, dim)
+        update = self.output_projection(attended) * spatial_amplitude[..., None]
+        return query + self.gate * update
 
 
 class AxialLocalCrossBlock(nn.Module):

@@ -10,9 +10,10 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from molai.models.attention import (
-    AxialLocalCrossBlock,
-    AxialLocalMixerBlock,
-    NoiseTokenCrossBlock,
+    CvTCrossBlock,
+    CvTMixerBlock,
+    FullResolutionCvTEncoder,
+    RandomMemoryAttention,
     sinusoidal_2d_position,
 )
 from molai.models.condition import AxialConditionPlane
@@ -30,7 +31,7 @@ class MolecularCloudOutput:
 
 
 class MolecularFieldCloud(nn.Module):
-    """Generate full-resolution molecular fields with axial/local attention only."""
+    """Generate molecular fields with full-resolution Q and pooled multiscale K/V."""
 
     def __init__(
         self,
@@ -39,11 +40,17 @@ class MolecularFieldCloud(nn.Module):
         dim: int = 64,
         heads: int = 4,
         condition_cross_depth: int = 2,
-        noise_cross_depth: int = 2,
+        noise_cross_depth: int = 1,
         noise_token_count: int = 64,
-        refine_depth: int = 8,
+        noise_token_dim: int | None = None,
+        noise_temperature: float = 0.8,
+        noise_gate_init: float = 0.02,
+        refine_depth: int = 6,
         window_size: int = 8,
         ffn_ratio: float = 2.0,
+        cvt_kernel_sizes: list[int] | tuple[int, ...] = (3, 5, 7),
+        cvt_output_sizes: list[int] | tuple[int, ...] = (8, 4, 2),
+        condition_gate_init: float = 0.5,
         max_resolution: int = 256,
         max_residual: float = 2.0,
         noise_energy_min: float = 1e-4,
@@ -56,54 +63,61 @@ class MolecularFieldCloud(nn.Module):
             raise ValueError("dim must be divisible by heads and by four")
         if noise_token_count < 1:
             raise ValueError("noise_token_count must be positive")
+        if noise_token_dim is not None and noise_token_dim < 1:
+            raise ValueError("noise_token_dim must be positive")
+        if noise_cross_depth != 1:
+            raise ValueError("the CvT cloud uses exactly one random-memory attention layer")
+        if refine_depth < 1 or condition_cross_depth < 1:
+            raise ValueError("condition and refinement depths must be positive")
         self.field_channels = field_channels
         self.dim = dim
+        self.noise_token_dim = dim if noise_token_dim is None else noise_token_dim
         self.max_residual = max_residual
         self.noise_energy_min = noise_energy_min
         self.noise_amplitude_max = noise_amplitude_max
         self.noise_token_count = noise_token_count
         self.gradient_checkpointing = gradient_checkpointing
 
-        self.field_embed = nn.Linear(field_channels, dim)
+        self.field_encoder = FullResolutionCvTEncoder(
+            field_channels,
+            dim,
+            heads,
+            cvt_kernel_sizes,
+            cvt_output_sizes,
+        )
         self.condition_plane = AxialConditionPlane(
             condition_dim, dim, max_resolution=max_resolution
         )
         self.condition_blocks = nn.ModuleList(
             [
-                AxialLocalCrossBlock(
-                    dim,
-                    heads,
-                    window_size,
-                    ffn_ratio,
-                    shifted=bool(index % 2),
-                    gate_init=0.5,
-                )
-                for index in range(condition_cross_depth)
-            ]
-        )
-        self.noise_blocks = nn.ModuleList(
-            [
-                NoiseTokenCrossBlock(
+                CvTCrossBlock(
                     dim,
                     heads,
                     ffn_ratio,
-                    gate_init=0.1,
+                    gate_init=condition_gate_init,
+                    kernel_sizes=cvt_kernel_sizes,
+                    output_sizes=cvt_output_sizes,
                 )
-                for _ in range(noise_cross_depth)
+                for _ in range(condition_cross_depth)
             ]
         )
-        pattern = ("local", "row", "local", "column")
+        self.noise_attention = RandomMemoryAttention(
+            dim,
+            heads,
+            self.noise_token_dim,
+            temperature=noise_temperature,
+            gate_init=noise_gate_init,
+        )
         self.refine_blocks = nn.ModuleList(
             [
-                AxialLocalMixerBlock(
+                CvTMixerBlock(
                     dim,
                     heads,
-                    pattern[index % len(pattern)],
-                    window_size,
                     ffn_ratio,
-                    shifted=index % len(pattern) == 2,
+                    kernel_sizes=cvt_kernel_sizes,
+                    output_sizes=cvt_output_sizes,
                 )
-                for index in range(refine_depth)
+                for _ in range(refine_depth)
             ]
         )
         self.energy_norm = nn.LayerNorm(dim)
@@ -111,9 +125,6 @@ class MolecularFieldCloud(nn.Module):
         initial_amplitude = math.sqrt(max(noise_energy_init - noise_energy_min, 1e-8))
         nn.init.zeros_(self.energy_head.weight)
         nn.init.constant_(self.energy_head.bias, math.log(math.expm1(initial_amplitude)))
-        self.noise_projection = nn.Linear(field_channels, dim, bias=False)
-        self.noise_token_basis = nn.Parameter(torch.empty(noise_token_count, dim))
-        nn.init.normal_(self.noise_token_basis, std=0.02)
         self.output_norm = nn.LayerNorm(dim)
         self.output_head = nn.Linear(dim, field_channels)
         self.readout = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, condition_dim))
@@ -129,10 +140,10 @@ class MolecularFieldCloud(nn.Module):
         if current.ndim != 4 or current.shape[1] != self.field_channels:
             raise ValueError("current must have shape [B,C,H,W]")
         _, _, height, width = current.shape
-        tokens = self.field_embed(current.permute(0, 2, 3, 1))
-        position = sinusoidal_2d_position(
-            height, width, self.dim, tokens.device, tokens.dtype
-        )[None]
+        tokens = self.field_encoder(current)
+        position = sinusoidal_2d_position(height, width, self.dim, tokens.device, tokens.dtype)[
+            None
+        ]
         tokens = tokens + position
         context = self.condition_plane(condition, height, width) + position
         for block in self.condition_blocks:
@@ -156,7 +167,7 @@ class MolecularFieldCloud(nn.Module):
                 batch,
                 samples,
                 self.noise_token_count,
-                self.dim,
+                self.noise_token_dim,
                 device=encoded.device,
                 dtype=encoded.dtype,
             )
@@ -166,16 +177,11 @@ class MolecularFieldCloud(nn.Module):
                 samples,
                 self.noise_token_count,
             ):
-                raise ValueError(
-                    "noise must have shape [B,M,K,D] or [B,M,K,C], "
-                    "where K is noise_token_count"
-                )
+                raise ValueError("noise must have shape [B,M,K,R], where K is noise_token_count")
             random_noise = noise.to(device=encoded.device, dtype=encoded.dtype)
-            if random_noise.shape[-1] == self.field_channels:
-                random_noise = self.noise_projection(random_noise)
-            elif random_noise.shape[-1] != self.dim:
-                raise ValueError("noise channels must match field_channels or model dim")
-        return random_noise + self.noise_token_basis.to(dtype=encoded.dtype)[None, None]
+            if random_noise.shape[-1] != self.noise_token_dim:
+                raise ValueError("noise channels must match noise_token_dim")
+        return random_noise
 
     def forward(
         self,
@@ -192,13 +198,12 @@ class MolecularFieldCloud(nn.Module):
         tokens = encoded[:, None].expand(-1, samples, -1, -1, -1)
         tokens = tokens.reshape(batch * samples, height, width, self.dim)
         noise_context = noise_tokens.reshape(
-            batch * samples, self.noise_token_count, self.dim
+            batch * samples, self.noise_token_count, self.noise_token_dim
         )
         spatial_amplitude = (energy / self.dim).sqrt()
         spatial_amplitude = spatial_amplitude[:, None].expand(-1, samples, -1, -1)
         spatial_amplitude = spatial_amplitude.reshape(batch * samples, height, width)
-        for block in self.noise_blocks:
-            tokens = self._run(block, tokens, noise_context, spatial_amplitude)
+        tokens = self._run(self.noise_attention, tokens, noise_context, spatial_amplitude)
         for block in self.refine_blocks:
             tokens = self._run(block, tokens)
 

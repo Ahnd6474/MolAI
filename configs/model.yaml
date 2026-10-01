@@ -4,11 +4,17 @@ model:
   fullres_dim: 64
   heads: 4
   condition_cross_depth: 2
-  noise_cross_depth: 2
+  condition_gate_init: 0.5
+  noise_cross_depth: 1
   noise_token_count: 64
-  refine_depth: 8
+  noise_token_dim: 64
+  noise_temperature: 0.8
+  noise_gate_init: 0.02
+  refine_depth: 6
   window_size: 8
   ffn_ratio: 2.0
+  cvt_kernel_sizes: [3, 5, 7]
+  cvt_output_sizes: [8, 4, 2]
   max_resolution: 256
   max_residual: 8.0
   noise_energy_min: 0.0001
