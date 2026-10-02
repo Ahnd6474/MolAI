@@ -32,6 +32,7 @@ cloud_matching:
     - {max_level: 64, jump: 8}
   level_sampling: uniform
   unroll_fraction: 0.0
+  zero_token_clean_mse_weight: 0.05
   noise_schedule:
     type: cosine_vp
     levels: 64
@@ -49,7 +50,7 @@ training:
   validation_fraction: 0.02
   condition_dropout: 0.0
   peak_chunk_size: 256
-  log_every: 1
+  log_every: 10
 
 spectrum_encoder:
   heads: 8

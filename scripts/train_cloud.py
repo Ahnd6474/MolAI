@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 import yaml
 from torch import Tensor, nn
+from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -253,22 +254,71 @@ def _distributed_mean(total: float, count: int, device: torch.device) -> float:
     return float(statistics[0] / statistics[1].clamp_min(1.0))
 
 
-def _triptych(clean: Tensor, current: Tensor, predicted: Tensor) -> Tensor:
-    """Create comparable actual/input/output panels using one scale per sample."""
+def _comparison_strip(
+    clean: Tensor,
+    current: Tensor,
+    zero_output: Tensor,
+    random_output: Tensor,
+) -> Tensor:
+    """Create actual/input/zero-token/random-output panels on a shared scale."""
 
     clean = clean[:, :1].float().cpu()
     current = current[:, :1].float().cpu()
-    predicted = predicted[:, :1].float().cpu()
-    triptychs = []
-    for actual, noisy, output in zip(clean, current, predicted, strict=True):
-        values = torch.cat((actual.flatten(), noisy.flatten(), output.flatten())).abs()
+    zero_output = zero_output[:, :1].float().cpu()
+    random_output = random_output[:, :1].float().cpu()
+    strips = []
+    for actual, noisy, deterministic, stochastic in zip(
+        clean, current, zero_output, random_output, strict=True
+    ):
+        values = torch.cat(
+            (
+                actual.flatten(),
+                noisy.flatten(),
+                deterministic.flatten(),
+                stochastic.flatten(),
+            )
+        ).abs()
         scale = torch.quantile(values, 0.995).clamp_min(1e-6)
         panels = [
-            ((image / scale).clamp(-1.0, 1.0) + 1.0) * 0.5 for image in (actual, noisy, output)
+            ((image / scale).clamp(-1.0, 1.0) + 1.0) * 0.5
+            for image in (actual, noisy, deterministic, stochastic)
         ]
         separator = torch.ones(1, actual.shape[-2], 3)
-        triptychs.append(torch.cat((panels[0], separator, panels[1], separator, panels[2]), dim=-1))
-    return torch.stack(triptychs)
+        pieces = []
+        for index, panel in enumerate(panels):
+            if index:
+                pieces.append(separator)
+            pieces.append(panel)
+        strips.append(torch.cat(pieces, dim=-1))
+    return torch.stack(strips)
+
+
+def _predict_zero_and_random(
+    cloud_runner: nn.Module,
+    current: Tensor,
+    condition: Tensor,
+    random_samples: int,
+    noise_token_count: int,
+    noise_token_dim: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Run one deterministic zero-token sample plus an independent random cloud."""
+
+    noise = torch.randn(
+        current.shape[0],
+        random_samples + 1,
+        noise_token_count,
+        noise_token_dim,
+        device=current.device,
+        dtype=current.dtype,
+    )
+    noise[:, 0].zero_()
+    fields, energy, embeddings = cloud_runner(
+        current,
+        condition,
+        samples=random_samples + 1,
+        noise=noise,
+    )
+    return fields[:, 0], fields[:, 1:], energy, embeddings
 
 
 def _update_latest(checkpoint_path: Path, latest_path: Path) -> None:
@@ -325,7 +375,10 @@ def _validate(
     validation_seed: int,
     writer: SummaryWriter | None,
     epoch: int,
-) -> float:
+    zero_token_clean_mse_weight: float,
+    noise_token_count: int,
+    noise_token_dim: int,
+) -> dict[str, float]:
     cloud_runner.eval()
     condition_runner.eval()
     cpu_rng = torch.random.get_rng_state()
@@ -334,9 +387,13 @@ def _validate(
     if device.type == "cuda":
         torch.cuda.manual_seed(validation_seed)
     total = 0.0
+    u_statistic_total = 0.0
+    zero_mse_total = 0.0
+    predicted_variance_total = 0.0
+    target_variance_total = 0.0
     count = 0
     images: Tensor | None = None
-    image_tag = "samples/actual_input_output"
+    preview_diversity: list[tuple[int, float, float]] = []
     try:
         for batch in loader:
             clean = batch["field"].to(device, non_blocking=True)
@@ -349,9 +406,29 @@ def _validate(
             )
             with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 condition = _condition_from_batch(condition_runner, batch, device)
-                predicted, _, _ = cloud_runner(transition.current, condition, samples=samples)
-                loss = loss_function(predicted, transition.target_cloud, transition.current)
-            total += float(loss) * clean.shape[0]
+                zero_output, predicted, _, _ = _predict_zero_and_random(
+                    cloud_runner,
+                    transition.current,
+                    condition,
+                    samples,
+                    noise_token_count,
+                    noise_token_dim,
+                )
+                u_statistic = loss_function(
+                    predicted, transition.target_cloud, transition.current
+                )
+                zero_mse = F.mse_loss(zero_output.float(), clean.float())
+                loss = u_statistic + zero_token_clean_mse_weight * zero_mse
+            batch_count = clean.shape[0]
+            total += float(loss) * batch_count
+            u_statistic_total += float(u_statistic) * batch_count
+            zero_mse_total += float(zero_mse) * batch_count
+            predicted_variance_total += float(
+                predicted.float().var(dim=1, unbiased=False).mean()
+            ) * batch_count
+            target_variance_total += float(
+                transition.target_cloud.float().var(dim=1, unbiased=False).mean()
+            ) * batch_count
             count += clean.shape[0]
             if images is None:
                 preview_levels = config["cloud_matching"].get(
@@ -371,32 +448,63 @@ def _validate(
                 with torch.autocast(
                     device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
                 ):
-                    preview_predicted, _, _ = cloud_runner(
+                    preview_zero, preview_predicted, _, _ = _predict_zero_and_random(
+                        cloud_runner,
                         preview_transition.current,
                         condition[:preview_count],
-                        samples=samples,
+                        samples,
+                        noise_token_count,
+                        noise_token_dim,
                     )
-                images = _triptych(
+                images = _comparison_strip(
                     clean[:preview_count],
                     preview_transition.current,
+                    preview_zero,
                     preview_predicted[:, 0],
                 )
-                image_tag = "samples/vp_" + "_".join(
-                    f"L{int(level):02d}" for level in preview_levels[:preview_count]
-                )
+                for index, level in enumerate(preview_levels[:preview_count]):
+                    predicted_variance = float(
+                        preview_predicted[index].float().var(dim=0, unbiased=False).mean()
+                    )
+                    target_variance = float(
+                        preview_transition.target_cloud[index]
+                        .float()
+                        .var(dim=0, unbiased=False)
+                        .mean()
+                    )
+                    preview_diversity.append(
+                        (int(level), predicted_variance, target_variance)
+                    )
     finally:
         torch.random.set_rng_state(cpu_rng)
         if cuda_rng is not None:
             torch.cuda.set_rng_state(cuda_rng, device)
-    mean = _distributed_mean(total, count, device)
+    metrics = {
+        "total": _distributed_mean(total, count, device),
+        "u_statistic": _distributed_mean(u_statistic_total, count, device),
+        "zero_token_clean_mse": _distributed_mean(zero_mse_total, count, device),
+        "predicted_variance": _distributed_mean(
+            predicted_variance_total, count, device
+        ),
+        "target_variance": _distributed_mean(target_variance_total, count, device),
+    }
+    metrics["diversity_ratio"] = metrics["predicted_variance"] / max(
+        metrics["target_variance"], 1e-12
+    )
     if writer is not None and images is not None:
         writer.add_images(
-            image_tag,
+            "samples/actual_input_zero_random",
             images,
             epoch + 1,
             dataformats="NCHW",
         )
-    return mean
+        for level, predicted_variance, target_variance in preview_diversity:
+            writer.add_scalar(
+                f"diversity/ratio_L{level:02d}",
+                predicted_variance / max(target_variance, 1e-12),
+                epoch + 1,
+            )
+    return metrics
 
 
 def main() -> None:
@@ -557,7 +665,13 @@ def main() -> None:
 
     schedule = _make_schedule(dataset.manifest, config, device)
     cloud_samples = int(config["cloud_matching"]["samples"])
-    low_noise_max_level = int(config["cloud_matching"].get("low_noise_max_level", 16))
+    zero_token_clean_mse_weight = float(
+        config["cloud_matching"].get("zero_token_clean_mse_weight", 0.0)
+    )
+    if zero_token_clean_mse_weight < 0.0:
+        raise ValueError("zero_token_clean_mse_weight must be non-negative")
+    noise_token_count = int(model_config["noise_token_count"])
+    noise_token_dim = int(model_config["noise_token_dim"])
     unroll_fraction = float(config["cloud_matching"].get("unroll_fraction", 0.0))
     if not 0.0 <= unroll_fraction <= 1.0:
         raise ValueError("unroll_fraction must lie in [0, 1]")
@@ -608,6 +722,8 @@ def main() -> None:
         cloud_runner.train()
         condition_runner.train()
         train_total = 0.0
+        train_u_statistic_total = 0.0
+        train_zero_mse_total = 0.0
         train_count = 0
         batch_end = time.perf_counter()
         for batch in train_loader:
@@ -630,13 +746,25 @@ def main() -> None:
                 condition = _condition_from_batch(condition_runner, batch, device)
                 keep = torch.rand(condition.shape[0], 1, device=device) >= condition_dropout
                 condition = condition * keep
-                predicted_fields, _, molecular_embeddings = cloud_runner(
-                    transition.current,
-                    condition,
-                    samples=cloud_samples,
+                zero_output, predicted_fields, _, molecular_embeddings = (
+                    _predict_zero_and_random(
+                        cloud_runner,
+                        transition.current,
+                        condition,
+                        cloud_samples,
+                        noise_token_count,
+                        noise_token_dim,
+                    )
                 )
                 distribution_loss = cloud_loss(
                     predicted_fields, transition.target_cloud, transition.current
+                )
+                zero_token_clean_mse = F.mse_loss(
+                    zero_output.float(), clean.float()
+                )
+                primary_loss = (
+                    distribution_loss
+                    + zero_token_clean_mse_weight * zero_token_clean_mse
                 )
                 unroll_loss = distribution_loss.new_zeros(())
                 unroll_count = min(
@@ -668,7 +796,7 @@ def main() -> None:
                     )
                 effective_unroll_fraction = unroll_count / clean.shape[0]
                 loss = (
-                    distribution_loss + effective_unroll_fraction * unroll_loss
+                    primary_loss + effective_unroll_fraction * unroll_loss
                 ) / (1.0 + effective_unroll_fraction)
                 loss = loss + molecular_embeddings.mean() * 0.0
             loss.backward()
@@ -680,87 +808,75 @@ def main() -> None:
             batch_seconds = time.perf_counter() - batch_start
             batch_end = time.perf_counter()
             train_total += loss_value * clean.shape[0]
+            train_u_statistic_total += float(distribution_loss.detach()) * clean.shape[0]
+            train_zero_mse_total += float(zero_token_clean_mse.detach()) * clean.shape[0]
             train_count += clean.shape[0]
             if rank == 0 and global_step % log_every == 0:
                 assert writer is not None
-                writer.add_scalar("batch/loss", loss_value, global_step)
+                writer.add_scalar("train/batch_total", loss_value, global_step)
                 writer.add_scalar(
-                    "batch/distribution_loss", float(distribution_loss.detach()), global_step
-                )
-                writer.add_scalar(
-                    "batch/current_level_mean",
-                    float(transition.current_levels.float().mean()),
+                    "train/batch_u_statistic",
+                    float(distribution_loss.detach()),
                     global_step,
                 )
                 writer.add_scalar(
-                    "batch/clean_fixed_fraction",
-                    float(transition.current_levels.eq(0).float().mean()),
+                    "train/batch_zero_token_clean_mse",
+                    float(zero_token_clean_mse.detach()),
                     global_step,
                 )
+                writer.add_scalar("train/grad_norm", float(grad_norm), global_step)
                 writer.add_scalar(
-                    "batch/low_level_fraction",
-                    float(
-                        (
-                            (transition.current_levels >= 1)
-                            & (transition.current_levels <= low_noise_max_level)
-                        )
-                        .float()
-                        .mean()
-                    ),
-                    global_step,
+                    "train/learning_rate", optimizer.param_groups[0]["lr"], global_step
                 )
-                if unroll_count:
-                    writer.add_scalar(
-                        "batch/unroll_loss", float(unroll_loss.detach()), global_step
-                    )
-                writer.add_scalar("batch/grad_norm", float(grad_norm), global_step)
                 writer.add_scalar(
-                    "batch/learning_rate", optimizer.param_groups[0]["lr"], global_step
-                )
-                writer.add_scalar("batch/seconds", batch_seconds, global_step)
-                writer.add_scalar(
-                    "batch/molecules_per_second",
+                    "performance/molecules_per_second",
                     clean.shape[0] * world_size / batch_seconds,
                     global_step,
                 )
-                peak_memory = None
-                peak_reserved = None
-                if device.type == "cuda":
-                    peak_memory = torch.cuda.max_memory_allocated(device) / 2**30
-                    peak_reserved = torch.cuda.max_memory_reserved(device) / 2**30
-                    writer.add_scalar("batch/gpu_peak_memory_gib", peak_memory, global_step)
-                    writer.add_scalar("batch/gpu_peak_reserved_gib", peak_reserved, global_step)
-                if "spectrum_to_molecule" in batch:
-                    writer.add_scalar(
-                        "batch/spectra",
-                        int(batch["spectrum_to_molecule"].numel()),
-                        global_step,
-                    )
-                    writer.add_scalar(
-                        "batch/peaks",
-                        int(batch["peak_mask"].sum()),
-                        global_step,
-                    )
-                    writer.add_scalar(
-                        "batch/peak_chunks",
-                        int(batch["peak_chunks"].shape[0]),
-                        global_step,
-                    )
+                predicted_variance = float(
+                    predicted_fields.detach().float().var(dim=1, unbiased=False).mean()
+                )
+                target_variance = float(
+                    transition.target_cloud.detach()
+                    .float()
+                    .var(dim=1, unbiased=False)
+                    .mean()
+                )
+                diversity_ratio = predicted_variance / max(target_variance, 1e-12)
+                writer.add_scalar(
+                    "diversity/batch_ratio", diversity_ratio, global_step
+                )
+                gate = cloud.noise_attention.gate.detach()
+                writer.add_scalar("model/random_attention_gate", float(gate), global_step)
+                peak_memory = (
+                    torch.cuda.max_memory_allocated(device) / 2**30
+                    if device.type == "cuda"
+                    else None
+                )
                 print(
                     f"epoch={epoch + 1}/{epochs} step={global_step} "
-                    f"loss={loss_value:.5f} grad={float(grad_norm):.4f} "
+                    f"loss={loss_value:.5f} ustat={float(distribution_loss.detach()):.5f} "
+                    f"zero_mse={float(zero_token_clean_mse.detach()):.5f} "
+                    f"diversity={diversity_ratio:.3f} "
+                    f"grad={float(grad_norm):.4f} "
                     f"lr={optimizer.param_groups[0]['lr']:.7f}"
                     + (
                         f" speed={clean.shape[0] * world_size / batch_seconds:.1f}mol/s"
-                        f" peak_mem={peak_memory:.2f}/{peak_reserved:.2f}GiB"
-                        if peak_memory is not None and peak_reserved is not None
+                        f" peak_mem={peak_memory:.2f}GiB"
+                        if peak_memory is not None
                         else ""
                     ),
                     flush=True,
                 )
 
         train_mean = _distributed_mean(train_total, train_count, device)
-        validation_mean = _validate(
+        train_u_statistic_mean = _distributed_mean(
+            train_u_statistic_total, train_count, device
+        )
+        train_zero_mse_mean = _distributed_mean(
+            train_zero_mse_total, train_count, device
+        )
+        validation = _validate(
             cloud_runner,
             condition_runner,
             validation_loader,
@@ -772,11 +888,35 @@ def main() -> None:
             training_seed + 100_003 + rank,
             writer,
             epoch,
+            zero_token_clean_mse_weight,
+            noise_token_count,
+            noise_token_dim,
         )
         if rank == 0:
             assert writer is not None
-            writer.add_scalar("epoch/train_loss_mean", train_mean, epoch + 1)
-            writer.add_scalar("epoch/validation_loss", validation_mean, epoch + 1)
+            writer.add_scalar("train/epoch_total_mean", train_mean, epoch + 1)
+            writer.add_scalar(
+                "train/epoch_u_statistic_mean", train_u_statistic_mean, epoch + 1
+            )
+            writer.add_scalar(
+                "train/epoch_zero_token_clean_mse_mean",
+                train_zero_mse_mean,
+                epoch + 1,
+            )
+            writer.add_scalar("validation/total", validation["total"], epoch + 1)
+            writer.add_scalar(
+                "validation/u_statistic", validation["u_statistic"], epoch + 1
+            )
+            writer.add_scalar(
+                "validation/zero_token_clean_mse",
+                validation["zero_token_clean_mse"],
+                epoch + 1,
+            )
+            writer.add_scalar(
+                "diversity/validation_ratio",
+                validation["diversity_ratio"],
+                epoch + 1,
+            )
             checkpoint_path = _save_checkpoint(
                 args.output,
                 epoch,
@@ -791,7 +931,9 @@ def main() -> None:
             writer.flush()
             print(
                 f"epoch={epoch + 1} train_mean={train_mean:.5f} "
-                f"validation={validation_mean:.5f} saved={checkpoint_path}",
+                f"validation={validation['total']:.5f} "
+                f"diversity={validation['diversity_ratio']:.4f} "
+                f"saved={checkpoint_path}",
                 flush=True,
             )
         if distributed:
