@@ -34,8 +34,8 @@ class VPSchedule:
         clean: Tensor,
         samples: int,
         current_levels: Tensor | None = None,
-        answer_jump: int = 10,
-        clean_answer_probability: float = 0.5,
+        answer_jump: int | Tensor = 10,
+        clean_answer_probability: float = 0.0,
     ) -> BridgeBatch:
         """Sample current fields and exact arbitrary-skip posterior clouds."""
 
@@ -47,9 +47,14 @@ class VPSchedule:
             current_levels = current_levels.to(device=device, dtype=torch.long)
             if current_levels.shape != (batch,):
                 raise ValueError("current_levels must have shape [B]")
-            if bool(((current_levels < 1) | (current_levels >= len(self.alpha_bar))).any()):
+            if bool(((current_levels < 0) | (current_levels >= len(self.alpha_bar))).any()):
                 raise ValueError("current_levels are outside the configured noise schedule")
-        answer_levels = (current_levels - answer_jump).clamp_min(0)
+        jumps = torch.as_tensor(answer_jump, device=device, dtype=torch.long)
+        if jumps.ndim == 0:
+            jumps = jumps.expand(batch)
+        if jumps.shape != (batch,) or bool((jumps < 0).any()):
+            raise ValueError("answer_jump must be non-negative and scalar or shape [B]")
+        answer_levels = (current_levels - jumps).clamp_min(0)
         force_clean = torch.rand(batch, device=device) < clean_answer_probability
         answer_levels = torch.where(force_clean, torch.zeros_like(answer_levels), answer_levels)
 
@@ -58,6 +63,35 @@ class VPSchedule:
         current = alpha_s.sqrt() * clean + (
             self.noise_scale * (1.0 - alpha_s).sqrt() * current_noise
         )
+
+        target_cloud = self.sample_target_cloud(
+            clean,
+            current,
+            current_levels,
+            answer_levels,
+            samples,
+        )
+        return BridgeBatch(current, target_cloud, current_levels, answer_levels)
+
+    def sample_target_cloud(
+        self,
+        clean: Tensor,
+        current: Tensor,
+        current_levels: Tensor,
+        answer_levels: Tensor,
+        samples: int,
+    ) -> Tensor:
+        """Sample the exact posterior target from a supplied current state."""
+
+        batch = clean.shape[0]
+        if current.shape != clean.shape:
+            raise ValueError("current and clean must share shape [B,C,H,W]")
+        current_levels = current_levels.to(device=clean.device, dtype=torch.long)
+        answer_levels = answer_levels.to(device=clean.device, dtype=torch.long)
+        if current_levels.shape != (batch,) or answer_levels.shape != (batch,):
+            raise ValueError("transition levels must have shape [B]")
+        if bool((answer_levels > current_levels).any()):
+            raise ValueError("answer levels cannot be noisier than current levels")
 
         alpha_a = self.alpha_bar[answer_levels].clone()
         alpha_a = torch.where(answer_levels.eq(0), torch.ones_like(alpha_a), alpha_a)
@@ -77,7 +111,7 @@ class VPSchedule:
             batch,
             samples,
             *clean.shape[1:],
-            device=device,
+            device=clean.device,
             dtype=clean.dtype,
         )
         target_cloud = mean + self.noise_scale * variance.sqrt().view(shape) * target_noise
@@ -86,7 +120,7 @@ class VPSchedule:
             clean[:, None],
             target_cloud,
         )
-        return BridgeBatch(current, target_cloud, current_levels, answer_levels)
+        return target_cloud
 
 
 class CosineVPSchedule(VPSchedule):
@@ -97,6 +131,7 @@ class CosineVPSchedule(VPSchedule):
         levels: int = 64,
         offset: float = 0.008,
         noise_scale: float = 1.0,
+        zero_mean_noise: bool = False,
         device: torch.device | str = "cpu",
     ) -> None:
         if levels < 2:
@@ -113,6 +148,102 @@ class CosineVPSchedule(VPSchedule):
         alpha_bar[-1] = 0.0
         self.alpha_bar = alpha_bar
         self.noise_scale = float(noise_scale)
+        self.zero_mean_noise = bool(zero_mean_noise)
+
+    def _center_noise(self, noise: Tensor) -> Tensor:
+        if not self.zero_mean_noise:
+            return noise
+        return noise - noise.mean(dim=(-2, -1), keepdim=True)
+
+    def sample_training_batch(
+        self,
+        clean: Tensor,
+        samples: int,
+        current_levels: Tensor | None = None,
+        answer_jump: int | Tensor = 8,
+        clean_answer_probability: float = 0.0,
+    ) -> BridgeBatch:
+        batch = clean.shape[0]
+        device = clean.device
+        if current_levels is None:
+            current_levels = torch.randint(1, len(self.alpha_bar), (batch,), device=device)
+        else:
+            current_levels = current_levels.to(device=device, dtype=torch.long)
+            if current_levels.shape != (batch,):
+                raise ValueError("current_levels must have shape [B]")
+            if bool(((current_levels < 0) | (current_levels >= len(self.alpha_bar))).any()):
+                raise ValueError("current_levels are outside the configured noise schedule")
+        jumps = torch.as_tensor(answer_jump, device=device, dtype=torch.long)
+        if jumps.ndim == 0:
+            jumps = jumps.expand(batch)
+        if jumps.shape != (batch,) or bool((jumps < 0).any()):
+            raise ValueError("answer_jump must be non-negative and scalar or shape [B]")
+        answer_levels = (current_levels - jumps).clamp_min(0)
+        force_clean = torch.rand(batch, device=device) < clean_answer_probability
+        answer_levels = torch.where(force_clean, torch.zeros_like(answer_levels), answer_levels)
+
+        alpha_s = self.alpha_bar[current_levels].view(batch, 1, 1, 1)
+        current_noise = self._center_noise(torch.randn_like(clean))
+        current = alpha_s.sqrt() * clean + (
+            self.noise_scale * (1.0 - alpha_s).sqrt() * current_noise
+        )
+        target_cloud = self.sample_target_cloud(
+            clean,
+            current,
+            current_levels,
+            answer_levels,
+            samples,
+        )
+        return BridgeBatch(current, target_cloud, current_levels, answer_levels)
+
+    def sample_target_cloud(
+        self,
+        clean: Tensor,
+        current: Tensor,
+        current_levels: Tensor,
+        answer_levels: Tensor,
+        samples: int,
+    ) -> Tensor:
+        batch = clean.shape[0]
+        if current.shape != clean.shape:
+            raise ValueError("current and clean must share shape [B,C,H,W]")
+        current_levels = current_levels.to(device=clean.device, dtype=torch.long)
+        answer_levels = answer_levels.to(device=clean.device, dtype=torch.long)
+        if current_levels.shape != (batch,) or answer_levels.shape != (batch,):
+            raise ValueError("transition levels must have shape [B]")
+        if bool((answer_levels > current_levels).any()):
+            raise ValueError("answer levels cannot be noisier than current levels")
+
+        alpha_a = self.alpha_bar[answer_levels].clone()
+        alpha_a = torch.where(answer_levels.eq(0), torch.ones_like(alpha_a), alpha_a)
+        alpha_s = self.alpha_bar[current_levels]
+        alpha_s_given_a = alpha_s / alpha_a
+        denominator = (1.0 - alpha_s).clamp_min(1e-8)
+        clean_coefficient = alpha_a.sqrt() * (1.0 - alpha_s_given_a) / denominator
+        current_coefficient = alpha_s_given_a.sqrt() * (1.0 - alpha_a) / denominator
+        variance = (
+            (1.0 - alpha_a) * (1.0 - alpha_s_given_a) / denominator
+        ).clamp_min(0.0)
+        shape = (batch, 1, 1, 1, 1)
+        mean = (
+            clean_coefficient.view(shape) * clean[:, None]
+            + current_coefficient.view(shape) * current[:, None]
+        )
+        target_noise = self._center_noise(
+            torch.randn(
+                batch,
+                samples,
+                *clean.shape[1:],
+                device=clean.device,
+                dtype=clean.dtype,
+            )
+        )
+        target_cloud = mean + self.noise_scale * variance.sqrt().view(shape) * target_noise
+        return torch.where(
+            answer_levels.view(batch, 1, 1, 1, 1).eq(0),
+            clean[:, None],
+            target_cloud,
+        )
 
 
 class GeometricVESchedule:
@@ -140,7 +271,7 @@ class GeometricVESchedule:
         samples: int,
         current_levels: Tensor | None = None,
         answer_jump: int = 8,
-        clean_answer_probability: float = 0.5,
+        clean_answer_probability: float = 0.0,
     ) -> BridgeBatch:
         """Sample a noisy current image and exact lower-noise posterior cloud."""
 

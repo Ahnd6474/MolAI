@@ -55,6 +55,7 @@ class MolecularFieldCloud(nn.Module):
         noise_energy_min: float = 1e-4,
         noise_energy_init: float = 0.1,
         noise_amplitude_max: float = 8.0,
+        zero_mean_output: bool = False,
         gradient_checkpointing: bool = True,
     ) -> None:
         super().__init__()
@@ -74,6 +75,7 @@ class MolecularFieldCloud(nn.Module):
         self.noise_energy_min = noise_energy_min
         self.noise_amplitude_max = noise_amplitude_max
         self.noise_token_count = noise_token_count
+        self.zero_mean_output = zero_mean_output
         self.gradient_checkpointing = gradient_checkpointing
 
         self.field_encoder = FullResolutionCvTEncoder(
@@ -209,6 +211,9 @@ class MolecularFieldCloud(nn.Module):
         residual = residual.permute(0, 3, 1, 2)
         expanded_current = current[:, None].expand(-1, samples, -1, -1, -1)
         fields = expanded_current.reshape(batch * samples, *current.shape[1:]) + residual
+        if self.zero_mean_output:
+            spatial_mean = fields.float().mean(dim=(-2, -1), keepdim=True)
+            fields = fields - spatial_mean.to(fields.dtype)
         molecular_embeddings = self.readout(tokens.mean(dim=(1, 2)))
         return (
             fields.reshape(batch, samples, *current.shape[1:]),

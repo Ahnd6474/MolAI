@@ -19,18 +19,27 @@ model:
   noise_energy_min: 0.0001
   noise_energy_init: 0.1
   noise_amplitude_max: 8.0
+  zero_mean_output: true
   gradient_checkpointing: false
 
 cloud_matching:
   batch_size_per_gpu: 16
   samples: 4
-  answer_jump: 8
-  clean_answer_probability: 0.25
+  transition_jumps:
+    - {max_level: 8, jump: 1}
+    - {max_level: 16, jump: 2}
+    - {max_level: 32, jump: 4}
+    - {max_level: 64, jump: 8}
+  low_noise_max_level: 16
+  low_noise_probability: 0.40
+  clean_fixed_probability: 0.075
+  unroll_fraction: 0.125
   noise_schedule:
     type: cosine_vp
     levels: 64
     cosine_offset: 0.008
     noise_scale: 3.5927782573874403
+    zero_mean_noise: true
   validation_preview_levels: [8, 24, 48, 64]
   loss: energy_full_band
   full_band_levels: 3

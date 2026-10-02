@@ -119,6 +119,39 @@ def test_cosine_vp_terminal_level_contains_no_clean_signal() -> None:
     torch.testing.assert_close(first.answer_levels, torch.full((2,), 56))
 
 
+def test_cosine_vp_centers_noise_and_supports_variable_jumps_and_fixed_points() -> None:
+    schedule = CosineVPSchedule(levels=64, noise_scale=3.5, zero_mean_noise=True)
+    clean = torch.randn(5, 1, 16, 16)
+    clean = clean - clean.mean(dim=(-2, -1), keepdim=True)
+    levels = torch.tensor([0, 4, 12, 24, 64])
+    jumps = torch.tensor([0, 1, 2, 4, 8])
+
+    bridge = schedule.sample_training_batch(
+        clean,
+        samples=3,
+        current_levels=levels,
+        answer_jump=jumps,
+    )
+
+    torch.testing.assert_close(bridge.answer_levels, torch.tensor([0, 3, 10, 20, 56]))
+    torch.testing.assert_close(bridge.current[0], clean[0])
+    torch.testing.assert_close(
+        bridge.target_cloud[0], clean[0].expand_as(bridge.target_cloud[0])
+    )
+    torch.testing.assert_close(
+        bridge.current.mean(dim=(-2, -1)),
+        torch.zeros(5, 1),
+        atol=2e-6,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        bridge.target_cloud.mean(dim=(-2, -1)),
+        torch.zeros(5, 3, 1),
+        atol=2e-6,
+        rtol=0.0,
+    )
+
+
 def test_cloud_raw_residual_is_not_limited_to_legacy_range() -> None:
     model = MolecularFieldCloud(
         condition_dim=32,
@@ -140,6 +173,30 @@ def test_cloud_raw_residual_is_not_limited_to_legacy_range() -> None:
     )
 
     torch.testing.assert_close(fields, torch.full_like(fields, 12.0))
+
+
+def test_cloud_can_project_every_output_to_zero_spatial_mean() -> None:
+    model = MolecularFieldCloud(
+        condition_dim=32,
+        dim=32,
+        heads=4,
+        condition_cross_depth=1,
+        noise_cross_depth=1,
+        noise_token_count=8,
+        refine_depth=1,
+        max_resolution=16,
+        zero_mean_output=True,
+        gradient_checkpointing=False,
+    ).eval()
+    current = torch.randn(2, 1, 8, 8)
+    fields, _, _ = model(current, torch.randn(2, 32), samples=3)
+
+    torch.testing.assert_close(
+        fields.float().mean(dim=(-2, -1)),
+        torch.zeros(2, 3, 1),
+        atol=2e-6,
+        rtol=0.0,
+    )
 
 
 def test_reused_band_pyramid_matches_direct_error_filtering() -> None:

@@ -25,7 +25,7 @@ from molai.data import (
     collate_spectrum_field_batch,
     open_field_dataset,
 )
-from molai.models.bridge import CosineVPSchedule, GeometricVESchedule, VPSchedule
+from molai.models.bridge import BridgeBatch, CosineVPSchedule, GeometricVESchedule, VPSchedule
 from molai.models.cloud import MolecularFieldCloud
 from molai.models.condition import SmilesConditionEncoder, SpectrumConditionEncoder
 from molai.models.losses import FullBandEnergyDistance
@@ -103,6 +103,7 @@ def _make_schedule(
                 levels=int(training_schedule.get("levels", 64)),
                 offset=float(training_schedule.get("cosine_offset", 0.008)),
                 noise_scale=float(training_schedule.get("noise_scale", 1.0)),
+                zero_mean_noise=bool(training_schedule.get("zero_mean_noise", False)),
                 device=device,
             )
         if schedule_type != "geometric_ve":
@@ -124,6 +125,46 @@ def _make_schedule(
     return VPSchedule(device=device)
 
 
+def _transition_jumps(current_levels: Tensor, config: dict) -> Tensor:
+    configured = config["cloud_matching"].get("transition_jumps")
+    if not configured:
+        return torch.full_like(
+            current_levels, int(config["cloud_matching"].get("answer_jump", 8))
+        )
+    jumps = torch.zeros_like(current_levels)
+    previous_maximum = 0
+    for band in configured:
+        maximum = int(band["max_level"])
+        jump = int(band["jump"])
+        if maximum <= previous_maximum or jump < 1:
+            raise ValueError("transition jump bands must have increasing maxima and positive jumps")
+        selected = (current_levels > previous_maximum) & (current_levels <= maximum)
+        jumps = torch.where(selected, jump, jumps)
+        previous_maximum = maximum
+    if bool((jumps[current_levels > 0] == 0).any()):
+        raise ValueError("transition jump bands do not cover every positive noise level")
+    return jumps
+
+
+def _sample_cosine_levels(batch: int, schedule: CosineVPSchedule, config: dict) -> Tensor:
+    options = config["cloud_matching"]
+    maximum = len(schedule.alpha_bar) - 1
+    low_maximum = int(options.get("low_noise_max_level", min(16, maximum)))
+    low_probability = float(options.get("low_noise_probability", 0.25))
+    fixed_probability = float(options.get("clean_fixed_probability", 0.0))
+    if not 1 <= low_maximum < maximum:
+        raise ValueError("low_noise_max_level must lie below the terminal level")
+    if not 0.0 <= low_probability <= 1.0 or not 0.0 <= fixed_probability <= 1.0:
+        raise ValueError("noise-level sampling probabilities must lie in [0, 1]")
+    device = schedule.alpha_bar.device
+    low = torch.rand(batch, device=device) < low_probability
+    low_levels = torch.randint(1, low_maximum + 1, (batch,), device=device)
+    high_levels = torch.randint(low_maximum + 1, maximum + 1, (batch,), device=device)
+    levels = torch.where(low, low_levels, high_levels)
+    fixed = torch.rand(batch, device=device) < fixed_probability
+    return torch.where(fixed, torch.zeros_like(levels), levels)
+
+
 def _sample_transition(
     schedule: VPSchedule | GeometricVESchedule,
     clean: Tensor,
@@ -131,25 +172,52 @@ def _sample_transition(
     config: dict,
     current_levels: Tensor | None = None,
 ):
-    options = {
-        "answer_jump": int(config["cloud_matching"].get("answer_jump", 8)),
-        "clean_answer_probability": float(
-            config["cloud_matching"].get("clean_answer_probability", 0.25)
-        ),
-    }
     if isinstance(schedule, GeometricVESchedule):
         return schedule.sample_training_batch(
             clean,
             samples,
             current_levels=current_levels,
-            **options,
+            answer_jump=int(config["cloud_matching"].get("answer_jump", 8)),
+            clean_answer_probability=0.0,
+        )
+    if isinstance(schedule, CosineVPSchedule):
+        if current_levels is None:
+            current_levels = _sample_cosine_levels(clean.shape[0], schedule, config)
+        jumps = _transition_jumps(current_levels, config)
+        return schedule.sample_training_batch(
+            clean,
+            samples,
+            current_levels=current_levels,
+            answer_jump=jumps,
+            clean_answer_probability=0.0,
         )
     return schedule.sample_training_batch(
         clean,
         samples,
         current_levels=current_levels,
-        **options,
+        answer_jump=int(config["cloud_matching"].get("answer_jump", 8)),
+        clean_answer_probability=0.0,
     )
+
+
+def _continue_cosine_transition(
+    schedule: CosineVPSchedule,
+    clean: Tensor,
+    current: Tensor,
+    current_levels: Tensor,
+    samples: int,
+    config: dict,
+) -> BridgeBatch:
+    jumps = _transition_jumps(current_levels, config)
+    answer_levels = (current_levels - jumps).clamp_min(0)
+    target_cloud = schedule.sample_target_cloud(
+        clean,
+        current,
+        current_levels,
+        answer_levels,
+        samples,
+    )
+    return BridgeBatch(current, target_cloud, current_levels, answer_levels)
 
 
 def _condition_from_batch(
@@ -432,6 +500,7 @@ def main() -> None:
         noise_energy_min=float(model_config["noise_energy_min"]),
         noise_energy_init=float(model_config["noise_energy_init"]),
         noise_amplitude_max=float(model_config["noise_amplitude_max"]),
+        zero_mean_output=bool(model_config.get("zero_mean_output", False)),
         gradient_checkpointing=bool(model_config["gradient_checkpointing"]),
     ).to(device)
     if isinstance(dataset, SpectrumFieldDataset):
@@ -483,6 +552,12 @@ def main() -> None:
 
     schedule = _make_schedule(dataset.manifest, config, device)
     cloud_samples = int(config["cloud_matching"]["samples"])
+    low_noise_max_level = int(config["cloud_matching"].get("low_noise_max_level", 16))
+    unroll_fraction = float(config["cloud_matching"].get("unroll_fraction", 0.0))
+    if not 0.0 <= unroll_fraction <= 1.0:
+        raise ValueError("unroll_fraction must lie in [0, 1]")
+    if unroll_fraction > 0.0 and not isinstance(schedule, CosineVPSchedule):
+        raise ValueError("two-step unrolling currently requires a cosine VP schedule")
     cloud_loss = FullBandEnergyDistance(
         levels=int(config["cloud_matching"]["full_band_levels"]),
         include_target_constant=False,
@@ -558,7 +633,39 @@ def main() -> None:
                 distribution_loss = cloud_loss(
                     predicted_fields, transition.target_cloud, transition.current
                 )
-                loss = distribution_loss + molecular_embeddings.mean() * 0.0
+                unroll_loss = distribution_loss.new_zeros(())
+                unroll_count = min(
+                    clean.shape[0], round(clean.shape[0] * unroll_fraction)
+                )
+                if unroll_fraction > 0.0 and unroll_count == 0:
+                    unroll_count = 1
+                if unroll_count:
+                    assert isinstance(schedule, CosineVPSchedule)
+                    selected = torch.randperm(clean.shape[0], device=device)[:unroll_count]
+                    rollout_current = predicted_fields[selected, 0]
+                    continued = _continue_cosine_transition(
+                        schedule,
+                        clean[selected],
+                        rollout_current,
+                        transition.answer_levels[selected],
+                        cloud_samples,
+                        config,
+                    )
+                    rollout_predicted, _, _ = cloud_runner(
+                        rollout_current,
+                        condition[selected],
+                        samples=cloud_samples,
+                    )
+                    unroll_loss = cloud_loss(
+                        rollout_predicted,
+                        continued.target_cloud,
+                        continued.current,
+                    )
+                effective_unroll_fraction = unroll_count / clean.shape[0]
+                loss = (
+                    distribution_loss + effective_unroll_fraction * unroll_loss
+                ) / (1.0 + effective_unroll_fraction)
+                loss = loss + molecular_embeddings.mean() * 0.0
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0)
             optimizer.step()
@@ -572,6 +679,35 @@ def main() -> None:
             if rank == 0 and global_step % log_every == 0:
                 assert writer is not None
                 writer.add_scalar("batch/loss", loss_value, global_step)
+                writer.add_scalar(
+                    "batch/distribution_loss", float(distribution_loss.detach()), global_step
+                )
+                writer.add_scalar(
+                    "batch/current_level_mean",
+                    float(transition.current_levels.float().mean()),
+                    global_step,
+                )
+                writer.add_scalar(
+                    "batch/clean_fixed_fraction",
+                    float(transition.current_levels.eq(0).float().mean()),
+                    global_step,
+                )
+                writer.add_scalar(
+                    "batch/low_level_fraction",
+                    float(
+                        (
+                            (transition.current_levels >= 1)
+                            & (transition.current_levels <= low_noise_max_level)
+                        )
+                        .float()
+                        .mean()
+                    ),
+                    global_step,
+                )
+                if unroll_count:
+                    writer.add_scalar(
+                        "batch/unroll_loss", float(unroll_loss.detach()), global_step
+                    )
                 writer.add_scalar("batch/grad_norm", float(grad_norm), global_step)
                 writer.add_scalar(
                     "batch/learning_rate", optimizer.param_groups[0]["lr"], global_step
