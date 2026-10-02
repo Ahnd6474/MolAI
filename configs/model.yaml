@@ -30,10 +30,8 @@ cloud_matching:
     - {max_level: 16, jump: 2}
     - {max_level: 32, jump: 4}
     - {max_level: 64, jump: 8}
-  low_noise_max_level: 16
-  low_noise_probability: 0.40
-  clean_fixed_probability: 0.075
-  unroll_fraction: 0.125
+  level_sampling: uniform
+  unroll_fraction: 0.0
   noise_schedule:
     type: cosine_vp
     levels: 64

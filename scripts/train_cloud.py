@@ -149,6 +149,12 @@ def _transition_jumps(current_levels: Tensor, config: dict) -> Tensor:
 def _sample_cosine_levels(batch: int, schedule: CosineVPSchedule, config: dict) -> Tensor:
     options = config["cloud_matching"]
     maximum = len(schedule.alpha_bar) - 1
+    sampling = str(options.get("level_sampling", "stratified"))
+    device = schedule.alpha_bar.device
+    if sampling == "uniform":
+        return torch.randint(0, maximum + 1, (batch,), device=device)
+    if sampling != "stratified":
+        raise ValueError("level_sampling must be uniform or stratified")
     low_maximum = int(options.get("low_noise_max_level", min(16, maximum)))
     low_probability = float(options.get("low_noise_probability", 0.25))
     fixed_probability = float(options.get("clean_fixed_probability", 0.0))
@@ -156,7 +162,6 @@ def _sample_cosine_levels(batch: int, schedule: CosineVPSchedule, config: dict) 
         raise ValueError("low_noise_max_level must lie below the terminal level")
     if not 0.0 <= low_probability <= 1.0 or not 0.0 <= fixed_probability <= 1.0:
         raise ValueError("noise-level sampling probabilities must lie in [0, 1]")
-    device = schedule.alpha_bar.device
     low = torch.rand(batch, device=device) < low_probability
     low_levels = torch.randint(1, low_maximum + 1, (batch,), device=device)
     high_levels = torch.randint(low_maximum + 1, maximum + 1, (batch,), device=device)
