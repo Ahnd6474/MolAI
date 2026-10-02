@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from molai.models.attention import MultiscaleCvTAttention2d
@@ -9,7 +10,11 @@ from molai.models.condition import (
     SpectrumConditionEncoder,
 )
 from molai.models.image_smiles import FieldToSmiles
-from molai.models.losses import FullBandEnergyDistance, full_band_distance
+from molai.models.losses import (
+    FullBandEnergyDistance,
+    _off_diagonal_mean,
+    full_band_distance,
+)
 from molai.models.smiles import SmilesTokenizer
 
 
@@ -62,13 +67,39 @@ def test_cvt_attention_keeps_queries_and_compresses_only_context() -> None:
 def test_bridge_and_energy_distance() -> None:
     clean = torch.randn(2, 1, 16, 16).tanh()
     bridge = VPSchedule(steps=20).sample_training_batch(clean, samples=3)
-    loss = FullBandEnergyDistance(levels=2)(
+    legacy_loss = FullBandEnergyDistance(levels=2, unbiased=False)(
+        bridge.target_cloud, bridge.target_cloud, bridge.current
+    )
+    unbiased_loss = FullBandEnergyDistance(levels=2)(
         bridge.target_cloud, bridge.target_cloud, bridge.current
     )
 
     assert bridge.current.shape == clean.shape
     assert bridge.target_cloud.shape == (2, 3, 1, 16, 16)
-    assert abs(float(loss)) < 1e-5
+    assert abs(float(legacy_loss)) < 1e-5
+    assert torch.isfinite(unbiased_loss)
+
+
+def test_off_diagonal_mean_excludes_self_pairs() -> None:
+    distances = torch.tensor(
+        [
+            [
+                [0.001, 2.0, 4.0],
+                [2.0, 0.001, 6.0],
+                [4.0, 6.0, 0.001],
+            ]
+        ]
+    )
+
+    torch.testing.assert_close(_off_diagonal_mean(distances), torch.tensor(4.0))
+
+
+def test_unbiased_energy_distance_requires_two_samples() -> None:
+    cloud = torch.zeros(2, 1, 1, 8, 8)
+    current = torch.zeros(2, 1, 8, 8)
+
+    with pytest.raises(ValueError, match="at least two samples"):
+        FullBandEnergyDistance(levels=2)(cloud, cloud, current)
 
 
 def test_geometric_noise_bridge_uses_requested_levels() -> None:

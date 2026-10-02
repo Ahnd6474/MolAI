@@ -67,13 +67,36 @@ def _pairwise_cloud_distance(first: Tensor, second: Tensor, levels: int) -> Tens
     )
 
 
-class FullBandEnergyDistance(nn.Module):
-    """Energy distance between empirical clouds of field corrections."""
+def _off_diagonal_mean(distances: Tensor) -> Tensor:
+    """Average square pairwise-distance matrices without their diagonal."""
 
-    def __init__(self, levels: int = 3, include_target_constant: bool = True) -> None:
+    if distances.ndim != 3 or distances.shape[1] != distances.shape[2]:
+        raise ValueError("self-distance tensor must have shape [B,M,M]")
+    samples = distances.shape[1]
+    if samples < 2:
+        raise ValueError("unbiased energy distance requires at least two samples")
+    diagonal = distances.diagonal(dim1=1, dim2=2).sum(dim=1)
+    return ((distances.sum(dim=(1, 2)) - diagonal) / (samples * (samples - 1))).mean()
+
+
+class FullBandEnergyDistance(nn.Module):
+    """Energy distance between empirical clouds of field corrections.
+
+    The default U-statistic excludes self-pairs from the within-cloud terms. This
+    removes the finite-sample diversity shrinkage of the V-statistic, which is
+    especially large for the small sample clouds used during training.
+    """
+
+    def __init__(
+        self,
+        levels: int = 3,
+        include_target_constant: bool = True,
+        unbiased: bool = True,
+    ) -> None:
         super().__init__()
         self.levels = levels
         self.include_target_constant = include_target_constant
+        self.unbiased = unbiased
 
     def forward(self, predicted: Tensor, target: Tensor, current: Tensor) -> Tensor:
         if predicted.ndim != 5 or target.ndim != 5:
@@ -83,9 +106,19 @@ class FullBandEnergyDistance(nn.Module):
         predicted_bands = _cloud_band_features(predicted_correction, self.levels)
         target_bands = _cloud_band_features(target_correction, self.levels)
         cross = _pairwise_band_distance(predicted_bands, target_bands).mean()
-        within_predicted = _pairwise_band_distance(predicted_bands, predicted_bands).mean()
+        predicted_distances = _pairwise_band_distance(predicted_bands, predicted_bands)
+        within_predicted = (
+            _off_diagonal_mean(predicted_distances)
+            if self.unbiased
+            else predicted_distances.mean()
+        )
         loss = 2.0 * cross - within_predicted
         if self.include_target_constant:
-            within_target = _pairwise_band_distance(target_bands, target_bands).mean()
+            target_distances = _pairwise_band_distance(target_bands, target_bands)
+            within_target = (
+                _off_diagonal_mean(target_distances)
+                if self.unbiased
+                else target_distances.mean()
+            )
             loss = loss - within_target
         return loss
