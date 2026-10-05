@@ -1,13 +1,21 @@
 import pytest
 import torch
 
-from molai.models.attention import MultiscaleCvTAttention2d
+from molai.models.attention import MultiscaleCvTAttention2d, RandomMemoryAttention
 from molai.models.bridge import CosineVPSchedule, GeometricVESchedule, VPSchedule
-from molai.models.cloud import MolecularCloudModel, MolecularFieldCloud
+from molai.models.cloud import (
+    AbsoluteHiddenRolloutCloud,
+    AbsoluteMolecularFieldCloud,
+    EncoderAnchoredHiddenUpdate,
+    HiddenRolloutCloud,
+    MolecularCloudModel,
+    MolecularFieldCloud,
+)
 from molai.models.condition import (
     ExponentialDistanceConvBlock,
     PositionwiseAffinePeakEmbedding,
     SpectrumConditionEncoder,
+    SpectrumTokenEncoder,
 )
 from molai.models.image_smiles import FieldToSmiles
 from molai.models.losses import (
@@ -51,7 +59,7 @@ def test_cvt_attention_keeps_queries_and_compresses_only_context() -> None:
         dim=32,
         heads=4,
         kernel_sizes=(3, 5, 7),
-        output_sizes=(8, 4, 2),
+        grid_sizes=(8, 4, 2),
     )
     query = torch.randn(2, 16, 16, 32, requires_grad=True)
     context = torch.randn(2, 16, 16, 32)
@@ -291,6 +299,174 @@ def test_cloud_uses_one_random_attention_before_cvt_refinement() -> None:
     assert all(block.attention.pooled_token_count(16, 16) == 84 for block in model.refine_blocks)
 
 
+def test_random_attention_uses_channelwise_glu_gate() -> None:
+    attention = RandomMemoryAttention(
+        dim=8,
+        heads=2,
+        random_dim=4,
+        gate_init=0.02,
+    )
+    query = torch.randn(2, 4, 4, 8, requires_grad=True)
+    random_tokens = torch.randn(2, 6, 4)
+    output = attention(query, random_tokens, torch.ones(2, 4, 4))
+
+    torch.testing.assert_close(
+        torch.sigmoid(attention.gate_projection.bias),
+        torch.full((8,), 0.02),
+    )
+    output.square().mean().backward()
+    assert attention.gate_projection.weight.grad is not None
+
+
+def test_hidden_rollout_encodes_once_and_backpropagates_through_shared_steps() -> None:
+    cloud = MolecularFieldCloud(
+        condition_dim=32,
+        dim=32,
+        heads=4,
+        condition_cross_depth=1,
+        noise_cross_depth=1,
+        noise_token_count=8,
+        refine_depth=1,
+        max_resolution=16,
+        zero_mean_output=True,
+        gradient_checkpointing=False,
+    )
+    model = HiddenRolloutCloud(
+        cloud,
+        max_level=8,
+        gate_init=0.02,
+        decoder_dim=16,
+    )
+    assert model.state_update.attention.grid_sizes == (32, 16, 8)
+    assert model.state_update.attention.pooled_token_count(128, 128) == 1344
+    encoder_calls = 0
+
+    def count_encoder_calls(_module: torch.nn.Module, _inputs: tuple[torch.Tensor, ...]) -> None:
+        nonlocal encoder_calls
+        encoder_calls += 1
+
+    handle = cloud.field_encoder.register_forward_pre_hook(count_encoder_calls)
+    initial = torch.randn(2, 1, 8, 8)
+    condition = torch.randn(2, 32)
+    levels = torch.tensor([8, 4, 0])
+    noise = torch.randn(2, 2, 3, 8, 32)
+    output = model(initial, condition, levels, samples=2, noise=noise)
+    handle.remove()
+
+    assert encoder_calls == 1
+    assert output.fields.shape == (2, 2, 3, 1, 8, 8)
+    assert output.anchor_reconstruction.shape == initial.shape
+    assert output.final_hidden.shape == (2, 2, 8, 8, 32)
+    assert output.gate_means.shape == (2, 2, 3)
+    assert output.update_rms.shape == (2, 2, 3)
+    assert output.spatial_noise_energy.shape == (2, 2, 3, 8, 8)
+    torch.testing.assert_close(
+        output.fields.float().mean(dim=(-2, -1)),
+        torch.zeros(2, 2, 3, 1),
+        atol=2e-6,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        output.gate_means,
+        torch.full_like(output.gate_means, 0.02),
+        atol=1e-6,
+        rtol=0.0,
+    )
+
+    output.fields.square().mean().backward()
+    assert model.state_update.gate_bias.grad is not None
+    assert model.state_update.attention.attention.in_proj_weight.grad is not None
+    assert any(parameter.grad is not None for parameter in cloud.field_encoder.parameters())
+    assert cloud.condition_blocks[0].gate_projection.weight.grad is not None
+    assert model.output_head.output_projection.weight.grad is not None
+
+
+def test_absolute_decoder_accepts_encoder_anchor_directly() -> None:
+    cloud = MolecularFieldCloud(
+        field_channels=1,
+        condition_dim=16,
+        dim=16,
+        heads=4,
+        condition_cross_depth=1,
+        noise_cross_depth=1,
+        noise_token_count=4,
+        refine_depth=1,
+        max_resolution=8,
+        zero_mean_output=True,
+        gradient_checkpointing=False,
+    )
+    model = HiddenRolloutCloud(cloud, max_level=4, decoder_dim=8)
+    field = torch.randn(2, 1, 8, 8)
+
+    anchor = model.encode_anchor(field)
+    reconstruction = model.decode_absolute(anchor)
+
+    assert reconstruction.shape == field.shape
+    torch.testing.assert_close(
+        reconstruction.mean(dim=(-2, -1)),
+        torch.zeros(2, 1),
+        atol=1e-6,
+        rtol=0.0,
+    )
+    reconstruction.square().mean().backward()
+    assert model.output_head.direct_projection.weight.grad is not None
+
+
+def test_hidden_rollout_rejects_mismatched_noise_shape() -> None:
+    cloud = MolecularFieldCloud(
+        condition_dim=16,
+        dim=16,
+        heads=4,
+        condition_cross_depth=1,
+        noise_cross_depth=1,
+        noise_token_count=4,
+        refine_depth=1,
+        max_resolution=8,
+        gradient_checkpointing=False,
+    )
+    model = HiddenRolloutCloud(cloud, max_level=4)
+
+    with pytest.raises(ValueError, match=r"\[B,M,T,K,R\]"):
+        model(
+            torch.randn(1, 1, 8, 8),
+            torch.randn(1, 16),
+            torch.tensor([4, 0]),
+            samples=2,
+            noise=torch.randn(1, 2, 4, 16),
+        )
+
+
+def test_hidden_state_anchor_uses_encoder_as_query_and_model_as_context() -> None:
+    update = EncoderAnchoredHiddenUpdate(
+        dim=16,
+        heads=4,
+        max_level=4,
+        gate_init=0.02,
+        kernel_sizes=(3,),
+        grid_sizes=(2,),
+    )
+    encoder_hidden = torch.randn(2, 8, 8, 16)
+    model_hidden = torch.randn(2, 8, 8, 16)
+    captured: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def capture_attention_inputs(
+        _module: torch.nn.Module, inputs: tuple[torch.Tensor, ...]
+    ) -> None:
+        captured.append((inputs[0].detach(), inputs[1].detach()))
+
+    handle = update.attention.register_forward_pre_hook(capture_attention_inputs)
+    anchored, _, _ = update(encoder_hidden, model_hidden, torch.tensor([4, 0]))
+    handle.remove()
+
+    torch.testing.assert_close(captured[0][0], update.query_norm(encoder_hidden))
+    torch.testing.assert_close(captured[0][1], update.context_norm(model_hidden))
+    assert anchored.shape == encoder_hidden.shape
+
+    torch.nn.init.zeros_(update.candidate_projection.weight)
+    anchored, _, _ = update(encoder_hidden, model_hidden, torch.tensor([4, 0]))
+    torch.testing.assert_close(anchored, encoder_hidden)
+
+
 def test_smiles_tokenizer_round_trip() -> None:
     tokenizer = SmilesTokenizer.from_smiles(["CC(=O)O", "c1ccccc1Cl"])
     value = "c1ccccc1Cl"
@@ -361,6 +537,153 @@ def test_spectrum_condition_attention_supports_bfloat16_autocast() -> None:
 
     assert condition.shape == (2, 32)
     assert torch.isfinite(condition).all()
+
+
+def test_spectrum_token_encoder_keeps_every_twice_pooled_peak() -> None:
+    encoder = SpectrumTokenEncoder(
+        metadata_dim=3,
+        dim=16,
+        heads=4,
+        peak_conv_stages=2,
+        spectrum_layers=1,
+        dropout=0.0,
+        peak_position_dim=8,
+        mz_bin_width=1.0,
+        mz_upper_bound=1_000.0,
+        peak_chunk_size=8,
+    )
+    peak_chunks = torch.rand(3, 8, 2)
+    peak_chunks[..., 0] = peak_chunks[..., 0] * 800.0
+    peak_mask = torch.ones(3, 8, dtype=torch.bool)
+    chunk_to_spectrum = torch.tensor([0, 1, 2])
+    spectrum_to_molecule = torch.tensor([0, 1, 1])
+    metadata = torch.randn(3, 3)
+    precursor_mz = torch.tensor([500.0, 700.0, 650.0])
+
+    tokens, mask = encoder.forward_ragged_tokens(
+        peak_chunks,
+        peak_mask,
+        chunk_to_spectrum,
+        spectrum_to_molecule,
+        metadata,
+        precursor_mz,
+        molecule_count=2,
+    )
+
+    # Every eight-peak chunk leaves two tokens after two 2x pools. Molecule 1
+    # has two spectra/chunks and therefore retains all four tokens.
+    assert tokens.shape == (2, 4, 16)
+    assert mask.tolist() == [[True, True, False, False], [True, True, True, True]]
+    tokens[mask].square().mean().backward()
+    assert encoder.peak_conv_blocks[0].raw_tau.grad is not None
+
+
+def test_absolute_cloud_uses_masked_ms_tokens_and_backpropagates() -> None:
+    model = AbsoluteMolecularFieldCloud(
+        field_channels=1,
+        condition_dim=16,
+        dim=16,
+        heads=4,
+        condition_cross_depth=1,
+        noise_token_count=4,
+        noise_token_dim=8,
+        refine_depth=1,
+        cvt_kernel_sizes=(3, 3, 3),
+        cvt_grid_sizes=(4, 2, 1),
+        max_level=8,
+        decoder_dim=16,
+        gradient_checkpointing=False,
+    )
+    current = torch.randn(2, 1, 8, 8)
+    condition = torch.randn(2, 5, 16, requires_grad=True)
+    condition_mask = torch.tensor(
+        [[True, True, True, False, False], [True, True, True, True, True]]
+    )
+    output = model(
+        current,
+        condition,
+        torch.tensor([4, 8]),
+        samples=2,
+        condition_mask=condition_mask,
+        return_anchor_reconstruction=True,
+    )
+
+    assert output.fields.shape == (2, 2, 1, 8, 8)
+    assert output.anchor_reconstruction is not None
+    assert output.anchor_reconstruction.shape == current.shape
+    torch.testing.assert_close(
+        output.fields.mean(dim=(-2, -1)),
+        torch.zeros(2, 2, 1),
+        atol=2e-6,
+        rtol=0.0,
+    )
+    (output.fields.square().mean() + output.anchor_reconstruction.square().mean()).backward()
+    assert condition.grad is not None
+
+
+def test_absolute_hidden_rollout_branches_only_at_final_step() -> None:
+    cloud = AbsoluteMolecularFieldCloud(
+        field_channels=1,
+        condition_dim=16,
+        dim=16,
+        heads=4,
+        condition_cross_depth=1,
+        noise_token_count=4,
+        noise_token_dim=8,
+        refine_depth=1,
+        cvt_kernel_sizes=(3, 3, 3),
+        cvt_grid_sizes=(4, 2, 1),
+        max_level=8,
+        decoder_dim=16,
+        gradient_checkpointing=False,
+    )
+    model = AbsoluteHiddenRolloutCloud(cloud)
+    initial = torch.randn(2, 1, 8, 8)
+    condition = torch.randn(2, 5, 16, requires_grad=True)
+    mask = torch.tensor(
+        [[True, True, True, False, False], [True, True, True, True, True]]
+    )
+    levels = torch.tensor([8, 6, 4, 2])
+    intermediate_noise = torch.randn(2, 3, 4, 8)
+    final_noise = torch.randn(2, 5, 4, 8)
+    final_noise[:, 0].zero_()
+    encoder_calls = 0
+
+    def count_encoder_calls(_module: torch.nn.Module, _inputs: tuple[torch.Tensor, ...]) -> None:
+        nonlocal encoder_calls
+        encoder_calls += 1
+
+    handle = cloud.field_encoder.register_forward_pre_hook(count_encoder_calls)
+    output = model(
+        initial,
+        condition,
+        levels,
+        final_samples=5,
+        intermediate_noise=intermediate_noise,
+        final_noise=final_noise,
+        condition_mask=mask,
+    )
+    handle.remove()
+
+    assert encoder_calls == 1
+    assert output.fields.shape == (2, 5, 1, 8, 8)
+    assert output.final_hidden.shape == (2, 5, 8, 8, 16)
+    assert output.intermediate_gate_means.shape == (2, 3)
+    assert output.intermediate_update_rms.shape == (2, 3)
+    assert output.final_gate_means.shape == (2, 5)
+    assert output.final_update_rms.shape == (2, 5)
+    assert output.spatial_noise_energy.shape == (2, 4, 8, 8)
+    torch.testing.assert_close(
+        output.fields.mean(dim=(-2, -1)),
+        torch.zeros(2, 5, 1),
+        atol=2e-6,
+        rtol=0.0,
+    )
+
+    output.fields.square().mean().backward()
+    assert condition.grad is not None
+    assert cloud.field_encoder.input_projection.weight.grad is not None
+    assert cloud.state_update.gate_bias.grad is not None
 
 
 def test_peak_embedding_is_affine_in_raw_intensity() -> None:

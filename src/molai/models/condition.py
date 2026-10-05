@@ -257,6 +257,50 @@ class SetFeedForwardBlock(nn.Module):
         return tokens + self.ffn(tokens)
 
 
+class SetSelfAttentionBlock(nn.Module):
+    """Permutation-equivariant self-attention and FFN over set tokens."""
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        ffn_ratio: float,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        hidden = int(dim * ffn_ratio)
+        self.attention_norm = nn.LayerNorm(dim)
+        self.attention = nn.MultiheadAttention(
+            dim,
+            heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, tokens: Tensor, mask: Tensor) -> Tensor:
+        if tokens.ndim != 3 or mask.shape != tokens.shape[:2]:
+            raise ValueError("tokens and mask must have shapes [B,S,D] and [B,S]")
+        normalized = self.attention_norm(tokens)
+        update, _ = self.attention(
+            normalized,
+            normalized,
+            normalized,
+            key_padding_mask=~mask.bool(),
+            need_weights=False,
+        )
+        tokens = tokens + update
+        tokens = tokens + self.ffn(tokens)
+        return tokens.masked_fill(~mask.unsqueeze(-1), 0.0)
+
+
 class SpectrumConditionEncoder(nn.Module):
     """Distance-aware sparse CNN followed by compressed spectrum attention."""
 
@@ -291,6 +335,8 @@ class SpectrumConditionEncoder(nn.Module):
         self.peak_chunk_size = peak_chunk_size
         self.peak_chunk_batch = peak_chunk_batch
         self.mz_upper_bound = mz_upper_bound
+        self.spectrum_ffn_ratio = ffn_ratio
+        self.spectrum_dropout = dropout
         self.peak_embedding = PositionwiseAffinePeakEmbedding(
             dim,
             position_dim=peak_position_dim,
@@ -404,7 +450,7 @@ class SpectrumConditionEncoder(nn.Module):
             peaks.shape[0],
         )
 
-    def forward_ragged(
+    def _encode_spectra_ragged(
         self,
         peak_chunks: Tensor,
         peak_mask: Tensor,
@@ -414,7 +460,7 @@ class SpectrumConditionEncoder(nn.Module):
         precursor_mz: Tensor,
         molecule_count: int,
     ) -> Tensor:
-        """Encode all peaks and spectra from a CSR/chunked batch without truncation."""
+        """Encode all peaks into one token per spectrum without truncation."""
 
         if peak_chunks.ndim != 3 or peak_chunks.shape[-1] != 2:
             raise ValueError("peak_chunks must have shape [K,P,2]")
@@ -427,6 +473,51 @@ class SpectrumConditionEncoder(nn.Module):
             raise ValueError("spectrum_to_molecule must have shape [S]")
         if precursor_mz.shape != (spectrum_count,):
             raise ValueError("precursor_mz must have shape [S]")
+
+        compressed_tokens, compressed_segments, metadata_tokens = (
+            self._encode_compressed_peaks_ragged(
+                peak_chunks,
+                peak_mask,
+                chunk_to_spectrum,
+                spectrum_to_molecule,
+                metadata,
+                precursor_mz,
+                molecule_count,
+            )
+        )
+        spectrum_embeddings = self.peak_attention(
+            compressed_tokens, compressed_segments, metadata.shape[0]
+        )
+        spectrum_embeddings = spectrum_embeddings + metadata_tokens
+        for block in self.spectrum_blocks:
+            spectrum_embeddings = block(spectrum_embeddings)
+        return spectrum_embeddings
+
+    def _encode_compressed_peaks_ragged(
+        self,
+        peak_chunks: Tensor,
+        peak_mask: Tensor,
+        chunk_to_spectrum: Tensor,
+        spectrum_to_molecule: Tensor,
+        metadata: Tensor,
+        precursor_mz: Tensor,
+        molecule_count: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return every peak token after exactly two convolution/pool stages."""
+
+        if peak_chunks.ndim != 3 or peak_chunks.shape[-1] != 2:
+            raise ValueError("peak_chunks must have shape [K,P,2]")
+        if peak_mask.shape != peak_chunks.shape[:2]:
+            raise ValueError("peak_mask must have shape [K,P]")
+        spectrum_count = metadata.shape[0]
+        if chunk_to_spectrum.shape != peak_chunks.shape[:1]:
+            raise ValueError("chunk_to_spectrum must have shape [K]")
+        if spectrum_to_molecule.shape != (spectrum_count,):
+            raise ValueError("spectrum_to_molecule must have shape [S]")
+        if precursor_mz.shape != (spectrum_count,):
+            raise ValueError("precursor_mz must have shape [S]")
+        if molecule_count < 1:
+            raise ValueError("molecule_count must be positive")
 
         precursor_mz = torch.nan_to_num(
             precursor_mz, nan=0.0, posinf=self.mz_upper_bound, neginf=0.0
@@ -468,17 +559,104 @@ class SpectrumConditionEncoder(nn.Module):
             compressed_segment_parts.append(token_segments)
         compressed_tokens = torch.cat(compressed_parts)
         compressed_segments = torch.cat(compressed_segment_parts)
-        spectrum_embeddings = self.peak_attention(
-            compressed_tokens, compressed_segments, spectrum_count
+        return compressed_tokens, compressed_segments, metadata_tokens
+
+    def forward_ragged(
+        self,
+        peak_chunks: Tensor,
+        peak_mask: Tensor,
+        chunk_to_spectrum: Tensor,
+        spectrum_to_molecule: Tensor,
+        metadata: Tensor,
+        precursor_mz: Tensor,
+        molecule_count: int,
+    ) -> Tensor:
+        """Encode all peaks and spectra into one pooled vector per molecule."""
+
+        spectrum_embeddings = self._encode_spectra_ragged(
+            peak_chunks,
+            peak_mask,
+            chunk_to_spectrum,
+            spectrum_to_molecule,
+            metadata,
+            precursor_mz,
+            molecule_count,
         )
-        spectrum_embeddings = spectrum_embeddings + metadata_tokens
-        for block in self.spectrum_blocks:
-            spectrum_embeddings = block(spectrum_embeddings)
         molecule_embeddings = self.spectrum_pool(
             spectrum_embeddings, spectrum_to_molecule, molecule_count
         )
         molecule_embeddings = molecule_embeddings + self.molecule_token[:, 0]
         return self.output(molecule_embeddings)
+
+
+class SpectrumTokenEncoder(SpectrumConditionEncoder):
+    """Refine every twice-pooled peak token without attention pooling."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        layer_count = len(self.spectrum_blocks)
+        dim = self.output[-1].out_features
+        heads = self.peak_attention.heads
+        del self.spectrum_blocks
+        del self.peak_attention
+        del self.spectrum_pool
+        del self.molecule_token
+        self.spectrum_attention_blocks = nn.ModuleList(
+            [
+                SetSelfAttentionBlock(
+                    dim,
+                    heads,
+                    self.spectrum_ffn_ratio,
+                    self.spectrum_dropout,
+                )
+                for _ in range(layer_count)
+            ]
+        )
+
+    def forward_ragged_tokens(
+        self,
+        peak_chunks: Tensor,
+        peak_mask: Tensor,
+        chunk_to_spectrum: Tensor,
+        spectrum_to_molecule: Tensor,
+        metadata: Tensor,
+        precursor_mz: Tensor,
+        molecule_count: int,
+    ) -> tuple[Tensor, Tensor]:
+        compressed, compressed_segments, _ = (
+            self._encode_compressed_peaks_ragged(
+                peak_chunks,
+                peak_mask,
+                chunk_to_spectrum,
+                spectrum_to_molecule,
+                metadata,
+                precursor_mz,
+                molecule_count,
+            )
+        )
+        peak_to_molecule = spectrum_to_molecule[compressed_segments]
+        counts = torch.bincount(peak_to_molecule, minlength=molecule_count)
+        maximum = int(counts.max().item())
+        padded = compressed.new_zeros(
+            molecule_count,
+            maximum,
+            compressed.shape[-1],
+        )
+        mask = torch.zeros(
+            molecule_count,
+            maximum,
+            dtype=torch.bool,
+            device=compressed.device,
+        )
+        for molecule in range(molecule_count):
+            molecule_tokens = compressed[peak_to_molecule == molecule]
+            count = molecule_tokens.shape[0]
+            padded[molecule, :count] = molecule_tokens
+            mask[molecule, :count] = True
+        for block in self.spectrum_attention_blocks:
+            padded = block(padded, mask)
+        padded = self.output(padded)
+        return padded.masked_fill(~mask.unsqueeze(-1), 0.0), mask
 
 
 class AxialConditionPlane(nn.Module):

@@ -607,7 +607,7 @@ def main() -> None:
         window_size=int(model_config["window_size"]),
         ffn_ratio=float(model_config["ffn_ratio"]),
         cvt_kernel_sizes=[int(value) for value in model_config["cvt_kernel_sizes"]],
-        cvt_output_sizes=[int(value) for value in model_config["cvt_output_sizes"]],
+        cvt_grid_sizes=[int(value) for value in model_config["cvt_grid_sizes"]],
         condition_gate_init=float(model_config["condition_gate_init"]),
         max_resolution=int(model_config["max_resolution"]),
         noise_energy_min=float(model_config["noise_energy_min"]),
@@ -846,8 +846,10 @@ def main() -> None:
                 writer.add_scalar(
                     "diversity/batch_ratio", diversity_ratio, global_step
                 )
-                gate = cloud.noise_attention.gate.detach()
-                writer.add_scalar("model/random_attention_gate", float(gate), global_step)
+                gate = torch.sigmoid(
+                    cloud.noise_attention.gate_projection.bias.detach()
+                ).mean()
+                writer.add_scalar("model/random_attention_gate_bias", float(gate), global_step)
                 peak_memory = (
                     torch.cuda.max_memory_allocated(device) / 2**30
                     if device.type == "cuda"

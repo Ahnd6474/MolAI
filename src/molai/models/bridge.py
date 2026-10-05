@@ -93,6 +93,35 @@ class VPSchedule:
         if bool((answer_levels > current_levels).any()):
             raise ValueError("answer levels cannot be noisier than current levels")
 
+        mean, variance = self.target_mean_and_variance(
+            clean, current, current_levels, answer_levels
+        )
+        target_noise = torch.randn(
+            batch,
+            samples,
+            *clean.shape[1:],
+            device=clean.device,
+            dtype=clean.dtype,
+        )
+        target_cloud = mean[:, None] + self.noise_scale * variance.sqrt().view(
+            batch, 1, 1, 1, 1
+        ) * target_noise
+        return torch.where(
+            answer_levels.view(batch, 1, 1, 1, 1).eq(0),
+            clean[:, None],
+            target_cloud,
+        )
+
+    def target_mean_and_variance(
+        self,
+        clean: Tensor,
+        current: Tensor,
+        current_levels: Tensor,
+        answer_levels: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Return the exact arbitrary-skip posterior mean and scalar variance."""
+
+        batch = clean.shape[0]
         alpha_a = self.alpha_bar[answer_levels].clone()
         alpha_a = torch.where(answer_levels.eq(0), torch.ones_like(alpha_a), alpha_a)
         alpha_s_flat = self.alpha_bar[current_levels]
@@ -102,25 +131,13 @@ class VPSchedule:
         current_coefficient = alpha_s_given_a.sqrt() * (1.0 - alpha_a) / denominator
         variance = ((1.0 - alpha_a) * (1.0 - alpha_s_given_a) / denominator).clamp_min(0.0)
 
-        shape = (batch, 1, 1, 1, 1)
+        shape = (batch, 1, 1, 1)
         mean = (
-            clean_coefficient.view(shape) * clean[:, None]
-            + current_coefficient.view(shape) * current[:, None]
+            clean_coefficient.view(shape) * clean
+            + current_coefficient.view(shape) * current
         )
-        target_noise = torch.randn(
-            batch,
-            samples,
-            *clean.shape[1:],
-            device=clean.device,
-            dtype=clean.dtype,
-        )
-        target_cloud = mean + self.noise_scale * variance.sqrt().view(shape) * target_noise
-        target_cloud = torch.where(
-            answer_levels.view(batch, 1, 1, 1, 1).eq(0),
-            clean[:, None],
-            target_cloud,
-        )
-        return target_cloud
+        mean = torch.where(answer_levels.view(batch, 1, 1, 1).eq(0), clean, mean)
+        return mean, variance
 
 
 class CosineVPSchedule(VPSchedule):
@@ -214,20 +231,8 @@ class CosineVPSchedule(VPSchedule):
         if bool((answer_levels > current_levels).any()):
             raise ValueError("answer levels cannot be noisier than current levels")
 
-        alpha_a = self.alpha_bar[answer_levels].clone()
-        alpha_a = torch.where(answer_levels.eq(0), torch.ones_like(alpha_a), alpha_a)
-        alpha_s = self.alpha_bar[current_levels]
-        alpha_s_given_a = alpha_s / alpha_a
-        denominator = (1.0 - alpha_s).clamp_min(1e-8)
-        clean_coefficient = alpha_a.sqrt() * (1.0 - alpha_s_given_a) / denominator
-        current_coefficient = alpha_s_given_a.sqrt() * (1.0 - alpha_a) / denominator
-        variance = (
-            (1.0 - alpha_a) * (1.0 - alpha_s_given_a) / denominator
-        ).clamp_min(0.0)
-        shape = (batch, 1, 1, 1, 1)
-        mean = (
-            clean_coefficient.view(shape) * clean[:, None]
-            + current_coefficient.view(shape) * current[:, None]
+        mean, variance = self.target_mean_and_variance(
+            clean, current, current_levels, answer_levels
         )
         target_noise = self._center_noise(
             torch.randn(
@@ -238,7 +243,9 @@ class CosineVPSchedule(VPSchedule):
                 dtype=clean.dtype,
             )
         )
-        target_cloud = mean + self.noise_scale * variance.sqrt().view(shape) * target_noise
+        target_cloud = mean[:, None] + self.noise_scale * variance.sqrt().view(
+            batch, 1, 1, 1, 1
+        ) * target_noise
         return torch.where(
             answer_levels.view(batch, 1, 1, 1, 1).eq(0),
             clean[:, None],

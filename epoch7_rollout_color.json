@@ -1,0 +1,55 @@
+{
+  "checkpoint": "artifacts\\rollouts\\epoch-0007.pt",
+  "sample_index": 33,
+  "smiles": "Cc1occc1-c1nnc(NCc2cccc3c2OCO3)o1",
+  "levels": [
+    64,
+    56,
+    48,
+    40,
+    32,
+    28,
+    24,
+    20,
+    16,
+    14,
+    12,
+    10,
+    8,
+    7,
+    6,
+    5,
+    4,
+    3,
+    2,
+    1,
+    0
+  ],
+  "metrics": [
+    {
+      "path": "zero",
+      "correlation": 0.06237386539578438,
+      "mse": 11.347773551940918
+    },
+    {
+      "path": "random_1",
+      "correlation": -0.15462547540664673,
+      "mse": 19.790544509887695
+    },
+    {
+      "path": "random_2",
+      "correlation": 0.04744972288608551,
+      "mse": 22.49402618408203
+    },
+    {
+      "path": "random_3",
+      "correlation": 0.010382195934653282,
+      "mse": 18.429561614990234
+    },
+    {
+      "path": "random_4",
+      "correlation": 0.04175640270113945,
+      "mse": 13.17870044708252
+    }
+  ]
+}

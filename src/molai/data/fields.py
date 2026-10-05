@@ -219,6 +219,7 @@ class ShardShuffleSampler(Sampler[int]):
         validation_fraction: float = 0.0,
         split_seed: int = 17,
         shuffle: bool = True,
+        eligible_mask: Tensor | None = None,
     ) -> None:
         if replicas < 1 or not 0 <= rank < replicas:
             raise ValueError("rank must be in [0, replicas)")
@@ -228,6 +229,10 @@ class ShardShuffleSampler(Sampler[int]):
             raise ValueError("validation_fraction must be in [0, 1)")
         if split != "all" and validation_fraction <= 0.0:
             raise ValueError("train/validation splits require a positive validation fraction")
+        if eligible_mask is not None:
+            if eligible_mask.shape != (len(dataset),):
+                raise ValueError("eligible_mask must have one value per dataset record")
+            eligible_mask = eligible_mask.bool().cpu()
         self.dataset = dataset
         self.seed = seed
         self.rank = rank
@@ -241,6 +246,8 @@ class ShardShuffleSampler(Sampler[int]):
         for end in dataset.ends:
             selected: list[int] = []
             for index in range(start, end):
+                if eligible_mask is not None and not bool(eligible_mask[index]):
+                    continue
                 mixed = (
                     (index + 1) * 0x9E3779B185EBCA87 + split_seed
                 ) & ((1 << 64) - 1)

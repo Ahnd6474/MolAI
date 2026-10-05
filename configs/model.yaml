@@ -14,13 +14,96 @@ model:
   window_size: 8
   ffn_ratio: 2.0
   cvt_kernel_sizes: [3, 5, 7]
-  cvt_output_sizes: [8, 4, 2]
+  # Final K/V grid side lengths (8x8, 4x4, 2x2), not strides.
+  cvt_grid_sizes: [8, 4, 2]
   max_resolution: 256
   noise_energy_min: 0.0001
   noise_energy_init: 0.1
   noise_amplitude_max: 8.0
   zero_mean_output: true
   gradient_checkpointing: false
+
+# Load the pretrained MolecularFieldCloud and train only the encoder-anchored
+# cross/GLU state update and absolute decoder. Decoded images are supervised but
+# never re-encoded between hidden rollout steps.
+hidden_rollout:
+  enabled: true
+  max_level: 64
+  gate_init: 0.02
+  decoder_dim: 32
+  # Encoder-anchor cross-attention uses a denser K/V representation than the
+  # frozen residual backbone: 32x32 + 16x16 + 8x8 = 1,344 K/V tokens.
+  kv_grid_sizes: [32, 16, 8]
+  # Frozen-backbone one-step training uses one stochastic token sample.  The
+  # decoder reconstruction and encoder-anchored transition losses are joint.
+  batch_size_per_gpu: 64
+  samples: 1
+  reconstruction_weight: 1.0
+  transition_weight: 1.0
+  epochs: 20
+  learning_rate: 0.0001
+  min_learning_rate: 0.00001
+
+# From-scratch absolute-image Cloud. Image-space attention uses CvT; compressed
+# MS tokens and random tokens use ordinary cross-attention.
+absolute_model:
+  field_channels: 1
+  image_dim: 64
+  condition_dim: 64
+  heads: 4
+  condition_cross_depth: 2
+  condition_gate_init: 0.5
+  noise_token_count: 64
+  noise_token_dim: 64
+  noise_temperature: 0.8
+  noise_gate_init: 0.02
+  refine_depth: 6
+  ffn_ratio: 2.0
+  cvt_kernel_sizes: [3, 5, 7]
+  cvt_grid_sizes: [32, 16, 8]
+  max_level: 64
+  anchor_gate_init: 0.02
+  decoder_dim: 64
+  noise_energy_min: 0.0001
+  noise_energy_init: 0.1
+  noise_amplitude_max: 8.0
+  zero_mean_output: true
+  gradient_checkpointing: true
+
+absolute_training:
+  epochs: 120
+  batch_size_per_gpu: 16
+  validation_batch_size_per_gpu: 4
+  gradient_accumulation_steps: 1
+  samples: 4
+  zero_token_mse_weight: 0.05
+  learning_rate: 0.0001
+  min_learning_rate: 0.00001
+  warmup_steps: 1000
+  weight_decay: 0.0001
+  # Exclude only the extreme ~0.1% tail after the two peak-pooling stages.
+  max_postpool_peak_tokens: 8192
+
+# End-to-end hidden rollout fine-tuning.  The first seven shared steps follow
+# one stochastic path; the eighth step branches into zero-token + four random
+# outputs and receives the only training loss.
+absolute_hidden_rollout:
+  epochs: 12
+  levels: [64, 56, 48, 40, 32, 24, 16, 8]
+  batch_size_per_gpu: 8
+  validation_batch_size_per_gpu: 1
+  gradient_accumulation_steps: 3
+  gradient_checkpointing: false
+  intermediate_refine_depth: 6
+  compile_rollout: true
+  compile_mode: default
+  final_random_samples: 4
+  zero_token_mse_weight: 0.05
+  learning_rate: 0.00001
+  min_learning_rate: 0.000001
+  warmup_steps: 100
+  weight_decay: 0.0001
+  max_postpool_peak_tokens: 8192
 
 cloud_matching:
   batch_size_per_gpu: 16

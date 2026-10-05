@@ -177,6 +177,30 @@ def test_shard_sampler_molecule_split_is_disjoint(tmp_path) -> None:
     assert 10 <= len(validation_indices) <= 30
 
 
+def test_shard_sampler_excludes_ineligible_records(tmp_path) -> None:
+    records = 8
+    torch.save(
+        {
+            "field": torch.zeros(records, 1, 2, 2),
+            "smiles": ["C"] * records,
+            "inchikey14": ["ABCDEFGHIJKLMN"] * records,
+            "electron_count": torch.ones(records),
+            "formal_charge": torch.zeros(records),
+        },
+        tmp_path / "fields-000000.pt",
+    )
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"shards": [{"file": "fields-000000.pt", "records": records}]}),
+        encoding="utf-8",
+    )
+    dataset = FieldShardDataset(tmp_path)
+    eligible = torch.tensor([True, False, True, False, True, True, False, True])
+    sampler = ShardShuffleSampler(dataset, eligible_mask=eligible, shuffle=False)
+
+    assert list(sampler) == [0, 2, 4, 5, 7]
+    assert sampler.selected_count == 5
+
+
 def test_spectrum_field_dataset_decodes_and_collates(tmp_path) -> None:
     fields = tmp_path / "fields"
     fields.mkdir()
