@@ -261,7 +261,7 @@ class MolecularFieldCloud(nn.Module):
 
 
 class EncoderAnchoredHiddenUpdate(nn.Module):
-    """Let the original encoding query a model state, then GLU-gate the result."""
+    """Let an encoder state query a model state, then GLU-gate its residual update."""
 
     def __init__(
         self,
@@ -569,12 +569,10 @@ class AbsoluteMolecularFieldCloud(nn.Module):
 class AbsoluteHiddenRolloutCloud(nn.Module):
     """Run an absolute Cloud as cumulative shared residual steps.
 
-    The input field and MS condition are encoded once.  Every intermediate step
-    follows one stochastic hidden trajectory and adds its gated cross-attention
-    update to the current hidden state.  Only the final step expands into the
-    empirical output cloud used by the distributional loss.  The fixed encoder
-    anchor remains the cross-attention query, but it is not re-added as the
-    residual base at every step.
+    The input field is encoded once into the evolving ``enc`` state.  At every
+    step the backbone produces ``h = Model(enc)``; the current encoder state
+    queries that model state and receives a GLU-gated residual update.  Only the
+    final step expands into the empirical output cloud used by the loss.
     """
 
     def __init__(
@@ -681,8 +679,7 @@ class AbsoluteHiddenRolloutCloud(nn.Module):
         else:
             final_noise = final_noise.to(device=initial.device, dtype=initial.dtype)
 
-        anchor = self.cloud.encode_anchor(initial)
-        hidden = anchor
+        hidden = self.cloud.encode_anchor(initial)
         intermediate_gates = []
         intermediate_updates = []
         energies = []
@@ -700,10 +697,9 @@ class AbsoluteHiddenRolloutCloud(nn.Module):
             )
             for block in self.cloud.refine_blocks[: self.intermediate_refine_depth]:
                 proposed = self.cloud._run(block, proposed)
-            _, gate, update = self.cloud.state_update(
-                anchor, proposed, step_levels
+            hidden, gate, update = self.cloud.state_update(
+                hidden, proposed, step_levels
             )
-            hidden = hidden + update
             intermediate_gates.append(gate.float().mean(dim=(1, 2, 3)))
             intermediate_updates.append(
                 update.float().square().mean(dim=(1, 2, 3)).sqrt()
@@ -717,10 +713,6 @@ class AbsoluteHiddenRolloutCloud(nn.Module):
         energies.append(final_energy)
         proposed = proposed[:, None].expand(-1, final_samples, -1, -1, -1)
         proposed = proposed.reshape(batch * final_samples, height, width, self.cloud.dim)
-        expanded_anchor = anchor[:, None].expand(-1, final_samples, -1, -1, -1)
-        expanded_anchor = expanded_anchor.reshape(
-            batch * final_samples, height, width, self.cloud.dim
-        )
         expanded_hidden = hidden[:, None].expand(-1, final_samples, -1, -1, -1)
         expanded_hidden = expanded_hidden.reshape(
             batch * final_samples, height, width, self.cloud.dim
@@ -740,10 +732,9 @@ class AbsoluteHiddenRolloutCloud(nn.Module):
         )
         for block in self.cloud.refine_blocks:
             proposed = self.cloud._run(block, proposed)
-        _, final_gate, final_update = self.cloud.state_update(
-            expanded_anchor, proposed, expanded_levels
+        final_hidden, final_gate, final_update = self.cloud.state_update(
+            expanded_hidden, proposed, expanded_levels
         )
-        final_hidden = expanded_hidden + final_update
         fields = self.cloud.decode_absolute(final_hidden)
 
         empty = initial.new_empty((batch, 0), dtype=torch.float32)

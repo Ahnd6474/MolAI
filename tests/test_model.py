@@ -704,6 +704,10 @@ def test_absolute_hidden_rollout_accumulates_gated_updates() -> None:
     )
 
     class ConstantUpdate(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.encoder_inputs: list[torch.Tensor] = []
+
         def forward(
             self,
             encoder_hidden: torch.Tensor,
@@ -711,11 +715,13 @@ def test_absolute_hidden_rollout_accumulates_gated_updates() -> None:
             levels: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             del model_hidden, levels
+            self.encoder_inputs.append(encoder_hidden.detach().clone())
             update = torch.full_like(encoder_hidden, 0.25)
             gate = torch.ones_like(encoder_hidden)
             return encoder_hidden + update, gate, update
 
-    cloud.state_update = ConstantUpdate()
+    state_update = ConstantUpdate()
+    cloud.state_update = state_update
     model = AbsoluteHiddenRolloutCloud(cloud)
     initial = torch.randn(1, 1, 8, 8)
     condition = torch.randn(1, 5, 16)
@@ -736,6 +742,14 @@ def test_absolute_hidden_rollout_accumulates_gated_updates() -> None:
     expected = anchor + 4 * 0.25
     torch.testing.assert_close(output.final_hidden[:, 0], expected)
     torch.testing.assert_close(output.final_hidden[:, 1], expected)
+    assert len(state_update.encoder_inputs) == 4
+    torch.testing.assert_close(state_update.encoder_inputs[0], anchor)
+    torch.testing.assert_close(state_update.encoder_inputs[1], anchor + 0.25)
+    torch.testing.assert_close(state_update.encoder_inputs[2], anchor + 0.50)
+    torch.testing.assert_close(
+        state_update.encoder_inputs[3],
+        (anchor + 0.75).expand(2, -1, -1, -1),
+    )
 
 
 def test_peak_embedding_is_affine_in_raw_intensity() -> None:
