@@ -83,6 +83,11 @@ def parse_args() -> argparse.Namespace:
         choices=("default", "reduce-overhead", "max-autotune"),
         help="torch.compile mode for the complete rollout graph",
     )
+    parser.add_argument(
+        "--level-conditioning",
+        choices=("on", "off"),
+        help="override level embeddings in the hidden rollout",
+    )
     return parser.parse_args()
 
 
@@ -318,8 +323,13 @@ def main() -> None:
         if args.intermediate_refine_depth is not None
         else int(options.get("intermediate_refine_depth", len(cloud.refine_blocks)))
     )
+    use_level_conditioning = bool(options.get("use_level_conditioning", True))
+    if args.level_conditioning is not None:
+        use_level_conditioning = args.level_conditioning == "on"
     rollout = AbsoluteHiddenRolloutCloud(
-        cloud, intermediate_refine_depth=intermediate_refine_depth
+        cloud,
+        intermediate_refine_depth=intermediate_refine_depth,
+        use_level_conditioning=use_level_conditioning,
     ).to(device)
     compile_rollout = bool(options.get("compile_rollout", False))
     if args.compile_rollout is not None:
@@ -439,6 +449,7 @@ def main() -> None:
                     "final_zero_samples": 1,
                     "final_random_samples": random_samples,
                     "intermediate_refine_depth": intermediate_refine_depth,
+                    "use_level_conditioning": use_level_conditioning,
                     "compile_rollout": compile_rollout,
                     "compile_mode": compile_mode,
                     "cloud_parameters": sum(value.numel() for value in cloud.parameters()),

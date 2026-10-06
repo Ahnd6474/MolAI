@@ -300,33 +300,36 @@ class EncoderAnchoredHiddenUpdate(nn.Module):
         nn.init.constant_(self.level_amplitude.weight, math.log(math.expm1(1.0)))
 
     def forward(
-        self, encoder_hidden: Tensor, model_hidden: Tensor, levels: Tensor
+        self, encoder_hidden: Tensor, model_hidden: Tensor, levels: Tensor | None
     ) -> tuple[Tensor, Tensor, Tensor]:
         if model_hidden.shape != encoder_hidden.shape or model_hidden.ndim != 4:
             raise ValueError(
                 "model_hidden and encoder_hidden must have the same [B,H,W,D] shape"
             )
-        if levels.shape != (model_hidden.shape[0],):
-            raise ValueError("levels must have shape [B]")
-        if not torch.compiler.is_compiling() and torch.any(
-            (levels < 0) | (levels > self.max_level)
-        ):
-            raise ValueError(f"levels must be in [0, {self.max_level}]")
+        if levels is not None:
+            if levels.shape != (model_hidden.shape[0],):
+                raise ValueError("levels must have shape [B]")
+            if not torch.compiler.is_compiling() and torch.any(
+                (levels < 0) | (levels > self.max_level)
+            ):
+                raise ValueError(f"levels must be in [0, {self.max_level}]")
 
         cross_update = self.attention(
             self.query_norm(encoder_hidden), self.context_norm(model_hidden)
         )
         candidate = self.candidate_norm(self.candidate_projection(cross_update))
-        level = self.level_embedding(levels.long())[:, None, None]
-        gate_logits = (
-            self.gate_projection(cross_update) + self.level_gate(level)
-            + self.gate_bias
-        )
+        gate_logits = self.gate_projection(cross_update) + self.gate_bias
+        if levels is not None:
+            level = self.level_embedding(levels.long())[:, None, None]
+            gate_logits = gate_logits + self.level_gate(level)
         gate = torch.sigmoid(gate_logits)
-        amplitude = torch.nn.functional.softplus(
-            self.level_amplitude(levels.long()).float()
-        ).to(candidate.dtype)
-        update = amplitude[:, None, None] * gate * candidate
+        if levels is None:
+            update = gate * candidate
+        else:
+            amplitude = torch.nn.functional.softplus(
+                self.level_amplitude(levels.long()).float()
+            ).to(candidate.dtype)
+            update = amplitude[:, None, None] * gate * candidate
         return encoder_hidden + update, gate, update
 
 
@@ -580,6 +583,7 @@ class AbsoluteHiddenRolloutCloud(nn.Module):
         cloud: AbsoluteMolecularFieldCloud,
         *,
         intermediate_refine_depth: int | None = None,
+        use_level_conditioning: bool = True,
     ) -> None:
         super().__init__()
         self.cloud = cloud
@@ -591,6 +595,15 @@ class AbsoluteHiddenRolloutCloud(nn.Module):
                 "intermediate_refine_depth must lie between zero and refine_depth"
             )
         self.intermediate_refine_depth = intermediate_refine_depth
+        self.use_level_conditioning = use_level_conditioning
+        if not use_level_conditioning:
+            for module in (
+                cloud.level_embedding,
+                cloud.state_update.level_embedding,
+                cloud.state_update.level_gate,
+                cloud.state_update.level_amplitude,
+            ):
+                module.requires_grad_(False)
 
     def _normalize_levels(
         self, levels: Tensor, batch: int, device: torch.device
@@ -615,7 +628,9 @@ class AbsoluteHiddenRolloutCloud(nn.Module):
         condition_mask: Tensor | None,
         levels: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        proposed = hidden + self.cloud.level_embedding(levels)[:, None, None]
+        proposed = hidden
+        if self.use_level_conditioning:
+            proposed = proposed + self.cloud.level_embedding(levels)[:, None, None]
         for block in self.cloud.condition_blocks:
             proposed = self.cloud._run(
                 block, proposed, condition_tokens, condition_mask
@@ -698,7 +713,9 @@ class AbsoluteHiddenRolloutCloud(nn.Module):
             for block in self.cloud.refine_blocks[: self.intermediate_refine_depth]:
                 proposed = self.cloud._run(block, proposed)
             hidden, gate, update = self.cloud.state_update(
-                hidden, proposed, step_levels
+                hidden,
+                proposed,
+                step_levels if self.use_level_conditioning else None,
             )
             intermediate_gates.append(gate.float().mean(dim=(1, 2, 3)))
             intermediate_updates.append(
@@ -733,7 +750,9 @@ class AbsoluteHiddenRolloutCloud(nn.Module):
         for block in self.cloud.refine_blocks:
             proposed = self.cloud._run(block, proposed)
         final_hidden, final_gate, final_update = self.cloud.state_update(
-            expanded_hidden, proposed, expanded_levels
+            expanded_hidden,
+            proposed,
+            expanded_levels if self.use_level_conditioning else None,
         )
         fields = self.cloud.decode_absolute(final_hidden)
 
