@@ -686,6 +686,58 @@ def test_absolute_hidden_rollout_branches_only_at_final_step() -> None:
     assert cloud.state_update.gate_bias.grad is not None
 
 
+def test_absolute_hidden_rollout_accumulates_gated_updates() -> None:
+    cloud = AbsoluteMolecularFieldCloud(
+        field_channels=1,
+        condition_dim=16,
+        dim=16,
+        heads=4,
+        condition_cross_depth=1,
+        noise_token_count=4,
+        noise_token_dim=8,
+        refine_depth=1,
+        cvt_kernel_sizes=(3, 3, 3),
+        cvt_grid_sizes=(4, 2, 1),
+        max_level=8,
+        decoder_dim=16,
+        gradient_checkpointing=False,
+    )
+
+    class ConstantUpdate(torch.nn.Module):
+        def forward(
+            self,
+            encoder_hidden: torch.Tensor,
+            model_hidden: torch.Tensor,
+            levels: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            del model_hidden, levels
+            update = torch.full_like(encoder_hidden, 0.25)
+            gate = torch.ones_like(encoder_hidden)
+            return encoder_hidden + update, gate, update
+
+    cloud.state_update = ConstantUpdate()
+    model = AbsoluteHiddenRolloutCloud(cloud)
+    initial = torch.randn(1, 1, 8, 8)
+    condition = torch.randn(1, 5, 16)
+    levels = torch.tensor([8, 6, 4, 2])
+    intermediate_noise = torch.randn(1, 3, 4, 8)
+    final_noise = torch.randn(1, 2, 4, 8)
+    anchor = cloud.encode_anchor(initial)
+
+    output = model(
+        initial,
+        condition,
+        levels,
+        final_samples=2,
+        intermediate_noise=intermediate_noise,
+        final_noise=final_noise,
+    )
+
+    expected = anchor + 4 * 0.25
+    torch.testing.assert_close(output.final_hidden[:, 0], expected)
+    torch.testing.assert_close(output.final_hidden[:, 1], expected)
+
+
 def test_peak_embedding_is_affine_in_raw_intensity() -> None:
     embedding = PositionwiseAffinePeakEmbedding(
         dim=16,
