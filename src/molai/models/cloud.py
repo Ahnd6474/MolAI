@@ -68,6 +68,17 @@ class AbsoluteHiddenRolloutOutput:
     spatial_noise_energy: Tensor
 
 
+@dataclass(slots=True)
+class AbsoluteTrajectoryRolloutOutput:
+    """Decoded fields and diagnostics for persistent stochastic trajectories."""
+
+    fields: Tensor
+    final_hidden: Tensor
+    gate_means: Tensor
+    update_rms: Tensor
+    spatial_noise_energy: Tensor
+
+
 class MolecularFieldCloud(nn.Module):
     """Generate molecular fields with full-resolution Q and pooled multiscale K/V."""
 
@@ -781,6 +792,120 @@ class AbsoluteHiddenRolloutCloud(nn.Module):
             .sqrt()
             .reshape(batch, final_samples),
             spatial_noise_energy=torch.stack(energies, dim=1),
+        )
+
+
+class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
+    """Keep independent random paths alive through every hidden rollout step.
+
+    Unlike :class:`AbsoluteHiddenRolloutCloud`, this module branches before the
+    first transition and decodes every step.  This makes each transition
+    directly supervisable without an exponential branch expansion.
+    """
+
+    def forward(
+        self,
+        initial: Tensor,
+        condition_tokens: Tensor,
+        levels: Tensor,
+        *,
+        samples: int = 4,
+        noise: Tensor | None = None,
+        condition_mask: Tensor | None = None,
+    ) -> AbsoluteTrajectoryRolloutOutput:
+        if initial.ndim != 4 or initial.shape[1] != self.cloud.field_channels:
+            raise ValueError("initial must have shape [B,C,H,W]")
+        if condition_tokens.ndim != 3 or condition_tokens.shape[0] != initial.shape[0]:
+            raise ValueError("condition_tokens must have shape [B,K,C]")
+        if samples < 2:
+            raise ValueError("samples must be at least two")
+        if condition_mask is not None and condition_mask.shape != condition_tokens.shape[:2]:
+            raise ValueError("condition_mask must have shape [B,K]")
+
+        batch, _, height, width = initial.shape
+        levels = self._normalize_levels(levels, batch, initial.device)
+        steps = levels.shape[1]
+        expected_noise = (
+            batch,
+            steps,
+            samples,
+            self.cloud.noise_token_count,
+            self.cloud.noise_token_dim,
+        )
+        if noise is None:
+            noise = torch.randn(
+                *expected_noise, device=initial.device, dtype=initial.dtype
+            )
+        elif noise.shape != expected_noise:
+            raise ValueError("noise must have shape [B,T,M,K,R]")
+        else:
+            noise = noise.to(device=initial.device, dtype=initial.dtype)
+
+        hidden = self.cloud.encode_anchor(initial)
+        hidden = hidden[:, None].expand(-1, samples, -1, -1, -1)
+        expanded_condition = torch.repeat_interleave(
+            condition_tokens, samples, dim=0
+        )
+        expanded_mask = None
+        if condition_mask is not None:
+            expanded_mask = torch.repeat_interleave(
+                condition_mask, samples, dim=0
+            )
+
+        decoded_steps = []
+        gate_steps = []
+        update_steps = []
+        energy_steps = []
+        for step in range(steps):
+            flat_hidden = hidden.reshape(batch * samples, height, width, self.cloud.dim)
+            step_levels = levels[:, step][:, None].expand(-1, samples).reshape(-1)
+            proposed, energy = self._condition_and_refine(
+                flat_hidden, expanded_condition, expanded_mask, step_levels
+            )
+            proposed = self.cloud._run(
+                self.cloud.noise_attention,
+                proposed,
+                noise[:, step].reshape(
+                    batch * samples,
+                    self.cloud.noise_token_count,
+                    self.cloud.noise_token_dim,
+                ),
+                (energy / self.cloud.dim).sqrt(),
+            )
+            for block in self.cloud.refine_blocks[: self.intermediate_refine_depth]:
+                proposed = self.cloud._run(block, proposed)
+            flat_hidden, gate, update = self.cloud.state_update(
+                flat_hidden,
+                proposed,
+                step_levels if self.use_level_conditioning else None,
+            )
+            decoded = self.cloud.decode_absolute(flat_hidden)
+            hidden = flat_hidden.reshape(
+                batch, samples, height, width, self.cloud.dim
+            )
+            decoded_steps.append(
+                decoded.reshape(batch, samples, *decoded.shape[1:])
+            )
+            gate_steps.append(
+                gate.float().mean(dim=(1, 2, 3)).reshape(batch, samples)
+            )
+            update_steps.append(
+                update.float()
+                .square()
+                .mean(dim=(1, 2, 3))
+                .sqrt()
+                .reshape(batch, samples)
+            )
+            energy_steps.append(
+                energy.reshape(batch, samples, height, width)
+            )
+
+        return AbsoluteTrajectoryRolloutOutput(
+            fields=torch.stack(decoded_steps, dim=1),
+            final_hidden=hidden,
+            gate_means=torch.stack(gate_steps, dim=1),
+            update_rms=torch.stack(update_steps, dim=1),
+            spatial_noise_energy=torch.stack(energy_steps, dim=1),
         )
 
 

@@ -1,9 +1,8 @@
-"""Fine-tune the absolute Cloud as an eight-step hidden residual rollout.
+"""Train four persistent random paths through a short hidden rollout.
 
-The input field and MS spectra are encoded once.  Seven shared steps follow a
-single stochastic hidden path.  The final shared step branches into one
-zero-token output and four random outputs; only those final decoded fields
-receive the U-statistic and clean zero-token losses.
+Every decoded step receives an empirical U-statistic target and an absolute
+ensemble-mean loss.  The model carries four independent random trajectories
+without using level embeddings.
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ import torch
 import torch.distributed as dist
 import yaml
 from torch import Tensor, nn
-from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -36,7 +34,7 @@ from train_absolute_cloud import (
     _postpool_peak_token_counts,
     _strip,
 )
-from train_cloud import _make_schedule
+from train_cloud import _make_schedule, _transition_jumps
 
 from molai.data import (
     ShardShuffleSampler,
@@ -44,7 +42,10 @@ from molai.data import (
     collate_spectrum_field_batch,
 )
 from molai.models.bridge import CosineVPSchedule
-from molai.models.cloud import AbsoluteHiddenRolloutCloud, AbsoluteMolecularFieldCloud
+from molai.models.cloud import (
+    AbsoluteMolecularFieldCloud,
+    AbsoluteTrajectoryRolloutCloud,
+)
 from molai.models.condition import SpectrumTokenEncoder
 from molai.models.losses import FullBandEnergyDistance
 
@@ -71,74 +72,131 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--intermediate-refine-depth",
         type=int,
-        help="override the number of CvT refine blocks in the first seven steps",
+        help="override the number of CvT refine blocks in every rollout step",
     )
     parser.add_argument(
         "--compile-rollout",
         choices=("on", "off"),
-        help="compile the complete eight-step rollout before DDP wrapping",
+        help="compile the complete four-step rollout before DDP wrapping",
     )
     parser.add_argument(
         "--compile-mode",
         choices=("default", "reduce-overhead", "max-autotune"),
         help="torch.compile mode for the complete rollout graph",
     )
-    parser.add_argument(
-        "--level-conditioning",
-        choices=("on", "off"),
-        help="override level embeddings in the hidden rollout",
-    )
     return parser.parse_args()
-
-
-def _initial_noise(clean: Tensor, noise_scale: float) -> Tensor:
-    noise = torch.randn_like(clean)
-    noise = noise - noise.float().mean(dim=(-2, -1), keepdim=True).to(noise.dtype)
-    return noise_scale * noise
 
 
 def _noise_inputs(
     cloud: AbsoluteMolecularFieldCloud,
     batch: int,
     steps: int,
-    final_samples: int,
+    samples: int,
     reference: Tensor,
-) -> tuple[Tensor, Tensor]:
-    intermediate = torch.randn(
+) -> Tensor:
+    return torch.randn(
         batch,
-        steps - 1,
+        steps,
+        samples,
         cloud.noise_token_count,
         cloud.noise_token_dim,
         device=reference.device,
         dtype=reference.dtype,
     )
-    final = torch.randn(
-        batch,
-        final_samples,
-        cloud.noise_token_count,
-        cloud.noise_token_dim,
-        device=reference.device,
-        dtype=reference.dtype,
+
+
+def _level_path(start_levels: Tensor, steps: int, config: dict) -> tuple[Tensor, Tensor]:
+    current = start_levels
+    inputs = []
+    targets = []
+    for _ in range(steps):
+        inputs.append(current)
+        current = (current - _transition_jumps(current, config)).clamp_min(0)
+        targets.append(current)
+    return torch.stack(inputs, dim=1), torch.stack(targets, dim=1)
+
+
+def _trajectory_targets(
+    schedule: CosineVPSchedule,
+    clean: Tensor,
+    start_levels: Tensor,
+    target_levels: Tensor,
+    samples: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    initial = schedule.sample_training_batch(
+        clean,
+        samples=1,
+        current_levels=start_levels,
+        answer_jump=0,
+    ).current
+    means = []
+    variances = []
+    clouds = []
+    for step in range(target_levels.shape[1]):
+        step_levels = target_levels[:, step]
+        mean, variance = schedule.target_mean_and_variance(
+            clean, initial, start_levels, step_levels
+        )
+        means.append(mean)
+        variances.append(variance)
+        clouds.append(
+            schedule.sample_target_cloud(
+                clean, initial, start_levels, step_levels, samples
+            )
+        )
+    return (
+        initial,
+        torch.stack(means, dim=1),
+        torch.stack(variances, dim=1),
+        torch.stack(clouds, dim=1),
     )
-    final[:, 0].zero_()
-    return intermediate, final
 
 
 def _losses(
     output_fields: Tensor,
-    clean: Tensor,
+    target_means: Tensor,
+    target_variances: Tensor,
+    target_clouds: Tensor,
     initial: Tensor,
     loss_function: FullBandEnergyDistance,
-    zero_weight: float,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    zero = output_fields[:, 0]
-    random = output_fields[:, 1:]
-    target = clean[:, None].expand_as(random)
-    u_statistic = loss_function(random, target, initial)
-    zero_mse = F.mse_loss(zero.float(), clean.float())
-    loss = u_statistic + zero_weight * zero_mse
-    diversity = random.float().var(dim=1, unbiased=False).mean()
-    return loss, u_statistic, zero_mse, diversity
+    mean_weight: float,
+    noise_scale: float,
+) -> dict[str, Tensor]:
+    step_totals = []
+    step_u_statistics = []
+    step_mean_mses = []
+    step_normalized_mean_mses = []
+    for step in range(output_fields.shape[1]):
+        predicted = output_fields[:, step]
+        target_mean = target_means[:, step]
+        u_statistic = loss_function(
+            predicted, target_clouds[:, step], initial
+        )
+        predicted_mean = predicted.float().mean(dim=1)
+        squared_error = (predicted_mean - target_mean.float()).square().mean(
+            dim=(1, 2, 3)
+        )
+        target_energy = target_mean.float().square().mean(dim=(1, 2, 3))
+        target_energy = target_energy + noise_scale**2 * target_variances[:, step].float()
+        normalized_mean_mse = (
+            squared_error / target_energy.clamp_min(1e-4)
+        ).mean()
+        mean_mse = squared_error.mean()
+        step_u_statistics.append(u_statistic)
+        step_mean_mses.append(mean_mse)
+        step_normalized_mean_mses.append(normalized_mean_mse)
+        step_totals.append(u_statistic + mean_weight * normalized_mean_mse)
+
+    return {
+        "total": torch.stack(step_totals).mean(),
+        "u_statistic": torch.stack(step_u_statistics).mean(),
+        "ensemble_mean_mse": torch.stack(step_mean_mses).mean(),
+        "normalized_mean_mse": torch.stack(step_normalized_mean_mses).mean(),
+        "diversity": output_fields.float().var(dim=2, unbiased=False).mean(),
+        "step_total": torch.stack(step_totals),
+        "step_u_statistic": torch.stack(step_u_statistics),
+        "step_mean_mse": torch.stack(step_mean_mses),
+    }
 
 
 def _update_latest(path: Path, latest: Path) -> None:
@@ -174,7 +232,7 @@ def _save(
             "global_step": step,
             "config": config,
             "source_checkpoint": str(source_checkpoint),
-            "training_kind": "absolute-hidden-final-branch-rollout",
+            "training_kind": "absolute-four-path-four-step-rollout",
         },
         temporary,
     )
@@ -185,14 +243,15 @@ def _save(
 
 @torch.no_grad()
 def _validate(
-    rollout: AbsoluteHiddenRolloutCloud,
+    rollout: AbsoluteTrajectoryRolloutCloud,
     condition_runner: nn.Module,
     loader: DataLoader,
-    levels: Tensor,
-    noise_scale: float,
-    final_samples: int,
+    schedule: CosineVPSchedule,
+    steps: int,
+    samples: int,
     loss_function: FullBandEnergyDistance,
-    zero_weight: float,
+    mean_weight: float,
+    config: dict,
     device: torch.device,
     seed: int,
     max_batches: int | None,
@@ -207,11 +266,15 @@ def _validate(
     totals = {
         "total": 0.0,
         "u_statistic": 0.0,
-        "zero_token_mse": 0.0,
-        "final_diversity": 0.0,
+        "ensemble_mean_mse": 0.0,
+        "normalized_mean_mse": 0.0,
+        "diversity": 0.0,
         "output_rms": 0.0,
         "clean_rms": 0.0,
     }
+    step_totals = torch.zeros(steps, device=device, dtype=torch.float64)
+    step_u_statistics = torch.zeros_like(step_totals)
+    step_mean_mses = torch.zeros_like(step_totals)
     count = 0
     preview = None
     try:
@@ -219,43 +282,64 @@ def _validate(
             if max_batches is not None and batch_index >= max_batches:
                 break
             clean = batch["field"].to(device, non_blocking=True)
-            initial = _initial_noise(clean, noise_scale)
+            maximum = len(schedule.alpha_bar) - 1
+            start_levels = torch.randint(
+                1, maximum + 1, (len(clean),), device=device
+            )
+            input_levels, target_levels = _level_path(start_levels, steps, config)
+            initial, target_means, target_variances, target_clouds = _trajectory_targets(
+                schedule, clean, start_levels, target_levels, samples
+            )
             with torch.autocast(
                 device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
             ):
                 condition, condition_mask = _condition_tokens(
                     condition_runner, batch, device
                 )
-                intermediate_noise, final_noise = _noise_inputs(
-                    rollout.cloud, len(clean), len(levels), final_samples, clean
+                noise = _noise_inputs(
+                    rollout.cloud, len(clean), steps, samples, clean
                 )
                 output = rollout(
                     initial,
                     condition,
-                    levels,
-                    final_samples=final_samples,
-                    intermediate_noise=intermediate_noise,
-                    final_noise=final_noise,
+                    input_levels,
+                    samples=samples,
+                    noise=noise,
                     condition_mask=condition_mask,
                 )
-                loss, u_statistic, zero_mse, diversity = _losses(
-                    output.fields, clean, initial, loss_function, zero_weight
+                losses = _losses(
+                    output.fields,
+                    target_means,
+                    target_variances,
+                    target_clouds,
+                    initial,
+                    loss_function,
+                    mean_weight,
+                    float(schedule.noise_scale),
                 )
             size = len(clean)
             values = {
-                "total": loss,
-                "u_statistic": u_statistic,
-                "zero_token_mse": zero_mse,
-                "final_diversity": diversity,
+                "total": losses["total"],
+                "u_statistic": losses["u_statistic"],
+                "ensemble_mean_mse": losses["ensemble_mean_mse"],
+                "normalized_mean_mse": losses["normalized_mean_mse"],
+                "diversity": losses["diversity"],
                 "output_rms": output.fields.float().square().mean().sqrt(),
                 "clean_rms": clean.float().square().mean().sqrt(),
             }
             for name, value in values.items():
                 totals[name] += float(value) * size
+            step_totals += losses["step_total"].double() * size
+            step_u_statistics += losses["step_u_statistic"].double() * size
+            step_mean_mses += losses["step_mean_mse"].double() * size
             count += size
             if preview is None:
+                predicted_means = output.fields.float().mean(dim=2)
                 preview = _strip(
-                    clean[:4], initial[:4], output.fields[:4, 0], output.fields[:4, 1]
+                    clean[:4],
+                    initial[:4],
+                    *[predicted_means[:4, step] for step in range(steps)],
+                    output.fields[:4, -1, 0],
                 )
     finally:
         torch.random.set_rng_state(cpu_state)
@@ -264,6 +348,16 @@ def _validate(
     metrics = {
         name: _distributed_mean(value, count, device) for name, value in totals.items()
     }
+    for step in range(steps):
+        metrics[f"step_{step + 1}_total"] = _distributed_mean(
+            float(step_totals[step]), count, device
+        )
+        metrics[f"step_{step + 1}_u_statistic"] = _distributed_mean(
+            float(step_u_statistics[step]), count, device
+        )
+        metrics[f"step_{step + 1}_mean_mse"] = _distributed_mean(
+            float(step_mean_mses[step]), count, device
+        )
     return metrics, preview
 
 
@@ -290,13 +384,12 @@ def main() -> None:
     validation_batch_size = int(options["validation_batch_size_per_gpu"])
     accumulation = args.accumulation_steps or int(options["gradient_accumulation_steps"])
     epochs = args.epochs or int(options["epochs"])
-    levels = torch.tensor([int(value) for value in options["levels"]], device=device)
-    random_samples = int(options["final_random_samples"])
-    final_samples = random_samples + 1
-    zero_weight = float(options["zero_token_mse_weight"])
-    if len(levels) != 8:
-        raise ValueError("absolute hidden rollout requires exactly eight levels")
-    if random_samples < 2:
+    steps = int(options["steps"])
+    samples = int(options["random_samples"])
+    mean_weight = float(options["ensemble_mean_mse_weight"])
+    if steps != 4:
+        raise ValueError("this experiment requires exactly four rollout steps")
+    if samples < 2:
         raise ValueError("U-statistic requires at least two final random samples")
 
     dataset = SpectrumFieldDataset(args.data)
@@ -323,13 +416,10 @@ def main() -> None:
         if args.intermediate_refine_depth is not None
         else int(options.get("intermediate_refine_depth", len(cloud.refine_blocks)))
     )
-    use_level_conditioning = bool(options.get("use_level_conditioning", True))
-    if args.level_conditioning is not None:
-        use_level_conditioning = args.level_conditioning == "on"
-    rollout = AbsoluteHiddenRolloutCloud(
+    rollout = AbsoluteTrajectoryRolloutCloud(
         cloud,
         intermediate_refine_depth=intermediate_refine_depth,
-        use_level_conditioning=use_level_conditioning,
+        use_level_conditioning=False,
     ).to(device)
     compile_rollout = bool(options.get("compile_rollout", False))
     if args.compile_rollout is not None:
@@ -444,12 +534,11 @@ def main() -> None:
                 {
                     "source_checkpoint": str(args.checkpoint),
                     "source_epoch": int(source["epoch"]) + 1,
-                    "rollout_levels": levels.tolist(),
-                    "intermediate_samples": 1,
-                    "final_zero_samples": 1,
-                    "final_random_samples": random_samples,
+                    "rollout_steps": steps,
+                    "persistent_random_paths": samples,
+                    "ensemble_mean_mse_weight": mean_weight,
                     "intermediate_refine_depth": intermediate_refine_depth,
-                    "use_level_conditioning": use_level_conditioning,
+                    "use_level_conditioning": False,
                     "compile_rollout": compile_rollout,
                     "compile_mode": compile_mode,
                     "cloud_parameters": sum(value.numel() for value in cloud.parameters()),
@@ -467,7 +556,7 @@ def main() -> None:
             f"validation={validation_sampler.selected_count:,} "
             f"batch/GPU={batch_size} accumulation={accumulation} "
             f"effective_batch={batch_size * world_size * accumulation} "
-            f"levels={levels.tolist()} final_samples=1+{random_samples} "
+            f"steps={steps} persistent_paths={samples} "
             f"excluded_long_ms={excluded_count:,}",
             flush=True,
         )
@@ -481,7 +570,12 @@ def main() -> None:
         train_sampler.set_epoch(epoch)
         rollout_execution.train()
         condition_module.train()
-        totals = {"total": 0.0, "u_statistic": 0.0, "zero_token_mse": 0.0}
+        totals = {
+            "total": 0.0,
+            "u_statistic": 0.0,
+            "ensemble_mean_mse": 0.0,
+            "normalized_mean_mse": 0.0,
+        }
         count = 0
         for micro_step, batch in enumerate(train_loader):
             if args.max_steps is not None and global_step >= args.max_steps:
@@ -489,10 +583,15 @@ def main() -> None:
                 break
             started = time.perf_counter()
             clean = batch["field"].to(device, non_blocking=True)
-            initial = _initial_noise(clean, float(schedule.noise_scale))
-            intermediate_noise, final_noise = _noise_inputs(
-                cloud, len(clean), len(levels), final_samples, clean
+            maximum = len(schedule.alpha_bar) - 1
+            start_levels = torch.randint(
+                1, maximum + 1, (len(clean),), device=device
             )
+            input_levels, target_levels = _level_path(start_levels, steps, config)
+            initial, target_means, target_variances, target_clouds = _trajectory_targets(
+                schedule, clean, start_levels, target_levels, samples
+            )
+            noise = _noise_inputs(cloud, len(clean), steps, samples, clean)
             should_step = (
                 (micro_step + 1) % accumulation == 0
                 or micro_step + 1 == len(train_loader)
@@ -510,23 +609,25 @@ def main() -> None:
                     output = rollout_runner(
                         initial,
                         condition,
-                        levels,
-                        final_samples=final_samples,
-                        intermediate_noise=intermediate_noise,
-                        final_noise=final_noise,
+                        input_levels,
+                        samples=samples,
+                        noise=noise,
                         condition_mask=condition_mask,
                     )
-                    loss, u_statistic, zero_mse, diversity = _losses(
-                        output.fields, clean, initial, loss_function, zero_weight
+                    losses = _losses(
+                        output.fields,
+                        target_means,
+                        target_variances,
+                        target_clouds,
+                        initial,
+                        loss_function,
+                        mean_weight,
+                        float(schedule.noise_scale),
                     )
-                (loss / accumulation).backward()
+                (losses["total"] / accumulation).backward()
             size = len(clean)
-            for name, value in (
-                ("total", loss),
-                ("u_statistic", u_statistic),
-                ("zero_token_mse", zero_mse),
-            ):
-                totals[name] += float(value.detach()) * size
+            for name in totals:
+                totals[name] += float(losses[name].detach()) * size
             count += size
             if should_step:
                 grad_norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0)
@@ -537,42 +638,43 @@ def main() -> None:
                 if rank == 0 and global_step % log_every == 0:
                     assert writer is not None
                     seconds = time.perf_counter() - started
-                    writer.add_scalar("train/batch_total", float(loss.detach()), global_step)
                     writer.add_scalar(
-                        "train/batch_u_statistic", float(u_statistic.detach()), global_step
+                        "train/batch_total", float(losses["total"].detach()), global_step
                     )
                     writer.add_scalar(
-                        "train/batch_zero_token_mse", float(zero_mse.detach()), global_step
+                        "train/batch_u_statistic",
+                        float(losses["u_statistic"].detach()),
+                        global_step,
                     )
                     writer.add_scalar(
-                        "train/final_diversity", float(diversity.detach()), global_step
+                        "train/batch_ensemble_mean_mse",
+                        float(losses["ensemble_mean_mse"].detach()),
+                        global_step,
+                    )
+                    writer.add_scalar(
+                        "train/batch_normalized_mean_mse",
+                        float(losses["normalized_mean_mse"].detach()),
+                        global_step,
+                    )
+                    writer.add_scalar(
+                        "train/diversity", float(losses["diversity"].detach()), global_step
                     )
                     writer.add_scalar("train/grad_norm", float(grad_norm), global_step)
                     writer.add_scalar(
                         "train/learning_rate", scheduler.get_last_lr()[0], global_step
                     )
                     writer.add_scalar(
-                        "model/intermediate_gate_mean",
-                        float(output.intermediate_gate_means.detach().mean()),
+                        "model/gate_mean",
+                        float(output.gate_means.detach().mean()),
                         global_step,
                     )
                     writer.add_scalar(
-                        "model/intermediate_update_rms",
-                        float(output.intermediate_update_rms.detach().mean()),
+                        "model/update_rms",
+                        float(output.update_rms.detach().mean()),
                         global_step,
                     )
                     writer.add_scalar(
-                        "model/final_gate_mean",
-                        float(output.final_gate_means.detach().mean()),
-                        global_step,
-                    )
-                    writer.add_scalar(
-                        "model/final_update_rms",
-                        float(output.final_update_rms.detach().mean()),
-                        global_step,
-                    )
-                    writer.add_scalar(
-                        "model/final_output_rms",
+                        "model/output_rms",
                         float(output.fields.detach().float().square().mean().sqrt()),
                         global_step,
                     )
@@ -583,10 +685,11 @@ def main() -> None:
                     )
                     print(
                         f"epoch={epoch + 1}/{epochs} step={global_step} "
-                        f"loss={float(loss.detach()):.5f} "
-                        f"ustat={float(u_statistic.detach()):.5f} "
-                        f"zero_mse={float(zero_mse.detach()):.5f} "
-                        f"diversity={float(diversity.detach()):.5f} "
+                        f"loss={float(losses['total'].detach()):.5f} "
+                        f"ustat={float(losses['u_statistic'].detach()):.5f} "
+                        f"mean_mse={float(losses['ensemble_mean_mse'].detach()):.5f} "
+                        f"norm_mean={float(losses['normalized_mean_mse'].detach()):.5f} "
+                        f"diversity={float(losses['diversity'].detach()):.5f} "
                         f"grad={float(grad_norm):.3f} "
                         f"micro_speed={size * world_size / seconds:.1f}mol/s "
                         f"peak_mem={memory:.2f}GiB",
@@ -601,11 +704,12 @@ def main() -> None:
             rollout,
             condition_module,
             validation_loader,
-            levels,
-            float(schedule.noise_scale),
-            final_samples,
+            schedule,
+            steps,
+            samples,
             loss_function,
-            zero_weight,
+            mean_weight,
+            config,
             device,
             seed + 100_003 + rank,
             args.max_validation_batches,
@@ -618,7 +722,7 @@ def main() -> None:
                 writer.add_scalar(f"validation/{name}", value, epoch + 1)
             if preview is not None:
                 writer.add_images(
-                    "samples/clean_noise_zero_random",
+                    "samples/clean_input_step_means_final_random",
                     preview,
                     epoch + 1,
                     dataformats="NCHW",

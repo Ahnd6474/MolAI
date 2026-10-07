@@ -84,22 +84,21 @@ absolute_training:
   # Exclude only the extreme ~0.1% tail after the two peak-pooling stages.
   max_postpool_peak_tokens: 8192
 
-# End-to-end hidden rollout fine-tuning.  The first seven shared steps follow
-# one stochastic path; the eighth step branches into zero-token + four random
-# outputs and receives the only training loss.
+# Four persistent random trajectories receive direct supervision at every
+# hidden step.  U-statistic matches the transition cloud while the normalized
+# MSE of their ensemble mean pins the conditional mean and spatial position.
 absolute_hidden_rollout:
   epochs: 12
-  levels: [64, 56, 48, 40, 32, 24, 16, 8]
-  batch_size_per_gpu: 8
+  steps: 4
+  random_samples: 4
+  batch_size_per_gpu: 6
   validation_batch_size_per_gpu: 1
-  gradient_accumulation_steps: 3
+  gradient_accumulation_steps: 4
   gradient_checkpointing: false
   intermediate_refine_depth: 6
-  use_level_conditioning: false
-  compile_rollout: true
+  compile_rollout: false
   compile_mode: default
-  final_random_samples: 4
-  zero_token_mse_weight: 0.05
+  ensemble_mean_mse_weight: 1.0
   learning_rate: 0.00001
   min_learning_rate: 0.000001
   warmup_steps: 100

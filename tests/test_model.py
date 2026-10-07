@@ -6,6 +6,7 @@ from molai.models.bridge import CosineVPSchedule, GeometricVESchedule, VPSchedul
 from molai.models.cloud import (
     AbsoluteHiddenRolloutCloud,
     AbsoluteMolecularFieldCloud,
+    AbsoluteTrajectoryRolloutCloud,
     EncoderAnchoredHiddenUpdate,
     HiddenRolloutCloud,
     MolecularCloudModel,
@@ -797,6 +798,60 @@ def test_absolute_hidden_rollout_can_remove_all_level_conditioning() -> None:
     assert not cloud.state_update.level_embedding.weight.requires_grad
     assert not cloud.state_update.level_gate.weight.requires_grad
     assert not cloud.state_update.level_amplitude.weight.requires_grad
+
+
+def test_absolute_trajectory_rollout_keeps_four_paths_for_every_step() -> None:
+    cloud = AbsoluteMolecularFieldCloud(
+        field_channels=1,
+        condition_dim=16,
+        dim=16,
+        heads=4,
+        condition_cross_depth=1,
+        noise_token_count=4,
+        noise_token_dim=8,
+        refine_depth=1,
+        cvt_kernel_sizes=(3, 3, 3),
+        cvt_grid_sizes=(4, 2, 1),
+        max_level=8,
+        decoder_dim=16,
+        gradient_checkpointing=False,
+    )
+    model = AbsoluteTrajectoryRolloutCloud(
+        cloud, intermediate_refine_depth=1, use_level_conditioning=False
+    )
+    initial = torch.randn(2, 1, 8, 8)
+    condition = torch.randn(2, 5, 16, requires_grad=True)
+    mask = torch.tensor(
+        [[True, True, True, False, False], [True, True, True, True, True]]
+    )
+    levels = torch.tensor([[8, 6, 4, 2], [7, 5, 3, 1]])
+    noise = torch.randn(2, 4, 4, 4, 8)
+
+    output = model(
+        initial,
+        condition,
+        levels,
+        samples=4,
+        noise=noise,
+        condition_mask=mask,
+    )
+
+    assert output.fields.shape == (2, 4, 4, 1, 8, 8)
+    assert output.final_hidden.shape == (2, 4, 8, 8, 16)
+    assert output.gate_means.shape == (2, 4, 4)
+    assert output.update_rms.shape == (2, 4, 4)
+    assert output.spatial_noise_energy.shape == (2, 4, 4, 8, 8)
+    torch.testing.assert_close(
+        output.fields.mean(dim=(-2, -1)),
+        torch.zeros(2, 4, 4, 1),
+        atol=2e-6,
+        rtol=0.0,
+    )
+
+    output.fields.square().mean().backward()
+    assert condition.grad is not None
+    assert cloud.field_encoder.input_projection.weight.grad is not None
+    assert cloud.state_update.gate_bias.grad is not None
 
 
 def test_peak_embedding_is_affine_in_raw_intensity() -> None:
