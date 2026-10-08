@@ -834,10 +834,14 @@ def test_absolute_trajectory_rollout_keeps_four_paths_for_every_step() -> None:
         samples=4,
         noise=noise,
         condition_mask=mask,
+        compute_hidden_consistency=True,
     )
 
     assert output.fields.shape == (2, 4, 4, 1, 8, 8)
     assert output.final_hidden.shape == (2, 4, 8, 8, 16)
+    assert output.hidden_consistency_mse is not None
+    assert output.hidden_consistency_mse.shape == (2, 4, 4)
+    assert output.hidden_consistency_mse.requires_grad
     assert output.gate_means.shape == (2, 4, 4)
     assert output.update_rms.shape == (2, 4, 4)
     assert output.spatial_noise_energy.shape == (2, 4, 4, 8, 8)
@@ -848,7 +852,7 @@ def test_absolute_trajectory_rollout_keeps_four_paths_for_every_step() -> None:
         rtol=0.0,
     )
 
-    output.fields.square().mean().backward()
+    (output.fields.square().mean() + output.hidden_consistency_mse.mean()).backward()
     assert condition.grad is not None
     assert cloud.field_encoder.input_projection.weight.grad is not None
     assert cloud.state_update.gate_bias.grad is not None

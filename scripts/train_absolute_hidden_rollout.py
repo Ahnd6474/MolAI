@@ -154,18 +154,23 @@ def _trajectory_targets(
 
 def _losses(
     output_fields: Tensor,
+    hidden_consistency_mse: Tensor,
     target_means: Tensor,
     target_variances: Tensor,
     target_clouds: Tensor,
     initial: Tensor,
     loss_function: FullBandEnergyDistance,
     mean_weight: float,
+    hidden_consistency_weight: float,
     noise_scale: float,
 ) -> dict[str, Tensor]:
+    if hidden_consistency_mse.shape != output_fields.shape[:3]:
+        raise ValueError("hidden consistency MSE must have shape [B,T,M]")
     step_totals = []
     step_u_statistics = []
     step_mean_mses = []
     step_normalized_mean_mses = []
+    step_hidden_consistency_mses = []
     for step in range(output_fields.shape[1]):
         predicted = output_fields[:, step]
         target_mean = target_means[:, step]
@@ -182,20 +187,32 @@ def _losses(
             squared_error / target_energy.clamp_min(1e-4)
         ).mean()
         mean_mse = squared_error.mean()
+        hidden_mse = hidden_consistency_mse[:, step].mean()
         step_u_statistics.append(u_statistic)
         step_mean_mses.append(mean_mse)
         step_normalized_mean_mses.append(normalized_mean_mse)
-        step_totals.append(u_statistic + mean_weight * normalized_mean_mse)
+        step_hidden_consistency_mses.append(hidden_mse)
+        step_totals.append(
+            u_statistic
+            + mean_weight * normalized_mean_mse
+            + hidden_consistency_weight * hidden_mse
+        )
 
     return {
         "total": torch.stack(step_totals).mean(),
         "u_statistic": torch.stack(step_u_statistics).mean(),
         "ensemble_mean_mse": torch.stack(step_mean_mses).mean(),
         "normalized_mean_mse": torch.stack(step_normalized_mean_mses).mean(),
+        "hidden_consistency_mse": torch.stack(
+            step_hidden_consistency_mses
+        ).mean(),
         "diversity": output_fields.float().var(dim=2, unbiased=False).mean(),
         "step_total": torch.stack(step_totals),
         "step_u_statistic": torch.stack(step_u_statistics),
         "step_mean_mse": torch.stack(step_mean_mses),
+        "step_hidden_consistency_mse": torch.stack(
+            step_hidden_consistency_mses
+        ),
     }
 
 
@@ -222,6 +239,7 @@ def _add_tensorboard_layout(writer: SummaryWriter, steps: int) -> None:
                         "train/batch_total",
                         "train/batch_u_statistic",
                         "train/batch_normalized_mean_mse",
+                        "train/batch_hidden_consistency_mse",
                     ],
                 ],
                 "Ensemble mean error": [
@@ -250,6 +268,7 @@ def _add_tensorboard_layout(writer: SummaryWriter, steps: int) -> None:
                     [
                         "validation/u_statistic",
                         "validation/normalized_mean_mse",
+                        "validation/hidden_consistency_mse",
                     ],
                 ],
             },
@@ -257,6 +276,10 @@ def _add_tensorboard_layout(writer: SummaryWriter, steps: int) -> None:
                 "Total by step": ["Multiline", step_tags("total")],
                 "U-stat by step": ["Multiline", step_tags("u_statistic")],
                 "Mean MSE by step": ["Multiline", step_tags("mean_mse")],
+                "Hidden consistency by step": [
+                    "Multiline",
+                    step_tags("hidden_consistency_mse"),
+                ],
             },
             "04 Model dynamics": {
                 "Residual dynamics": [
@@ -295,7 +318,7 @@ def _save(
             "global_step": step,
             "config": config,
             "source_checkpoint": str(source_checkpoint),
-            "training_kind": "absolute-four-path-four-step-rollout",
+            "training_kind": "absolute-four-path-four-step-rollout-hidden-consistency",
         },
         temporary,
     )
@@ -314,6 +337,7 @@ def _validate(
     samples: int,
     loss_function: FullBandEnergyDistance,
     mean_weight: float,
+    hidden_consistency_weight: float,
     config: dict,
     device: torch.device,
     seed: int,
@@ -331,6 +355,7 @@ def _validate(
         "u_statistic": 0.0,
         "ensemble_mean_mse": 0.0,
         "normalized_mean_mse": 0.0,
+        "hidden_consistency_mse": 0.0,
         "diversity": 0.0,
         "output_rms": 0.0,
         "clean_rms": 0.0,
@@ -338,6 +363,7 @@ def _validate(
     step_totals = torch.zeros(steps, device=device, dtype=torch.float64)
     step_u_statistics = torch.zeros_like(step_totals)
     step_mean_mses = torch.zeros_like(step_totals)
+    step_hidden_consistency_mses = torch.zeros_like(step_totals)
     count = 0
     preview = None
     try:
@@ -369,15 +395,20 @@ def _validate(
                     samples=samples,
                     noise=noise,
                     condition_mask=condition_mask,
+                    compute_hidden_consistency=True,
                 )
+                if output.hidden_consistency_mse is None:
+                    raise RuntimeError("hidden consistency MSE was not computed")
                 losses = _losses(
                     output.fields,
+                    output.hidden_consistency_mse,
                     target_means,
                     target_variances,
                     target_clouds,
                     initial,
                     loss_function,
                     mean_weight,
+                    hidden_consistency_weight,
                     float(schedule.noise_scale),
                 )
             size = len(clean)
@@ -386,6 +417,7 @@ def _validate(
                 "u_statistic": losses["u_statistic"],
                 "ensemble_mean_mse": losses["ensemble_mean_mse"],
                 "normalized_mean_mse": losses["normalized_mean_mse"],
+                "hidden_consistency_mse": losses["hidden_consistency_mse"],
                 "diversity": losses["diversity"],
                 "output_rms": output.fields.float().square().mean().sqrt(),
                 "clean_rms": clean.float().square().mean().sqrt(),
@@ -395,6 +427,9 @@ def _validate(
             step_totals += losses["step_total"].double() * size
             step_u_statistics += losses["step_u_statistic"].double() * size
             step_mean_mses += losses["step_mean_mse"].double() * size
+            step_hidden_consistency_mses += (
+                losses["step_hidden_consistency_mse"].double() * size
+            )
             count += size
             if preview is None:
                 predicted_means = output.fields.float().mean(dim=2)
@@ -420,6 +455,9 @@ def _validate(
         )
         metrics[f"step_{step + 1}_mean_mse"] = _distributed_mean(
             float(step_mean_mses[step]), count, device
+        )
+        metrics[f"step_{step + 1}_hidden_consistency_mse"] = _distributed_mean(
+            float(step_hidden_consistency_mses[step]), count, device
         )
     return metrics, preview
 
@@ -450,6 +488,7 @@ def main() -> None:
     steps = int(options["steps"])
     samples = int(options["random_samples"])
     mean_weight = float(options["ensemble_mean_mse_weight"])
+    hidden_consistency_weight = float(options["hidden_consistency_mse_weight"])
     if steps != 4:
         raise ValueError("this experiment requires exactly four rollout steps")
     if samples < 2:
@@ -601,6 +640,7 @@ def main() -> None:
                     "rollout_steps": steps,
                     "persistent_random_paths": samples,
                     "ensemble_mean_mse_weight": mean_weight,
+                    "hidden_consistency_mse_weight": hidden_consistency_weight,
                     "intermediate_refine_depth": intermediate_refine_depth,
                     "use_level_conditioning": False,
                     "compile_rollout": compile_rollout,
@@ -639,6 +679,7 @@ def main() -> None:
             "u_statistic": 0.0,
             "ensemble_mean_mse": 0.0,
             "normalized_mean_mse": 0.0,
+            "hidden_consistency_mse": 0.0,
         }
         count = 0
         for micro_step, batch in enumerate(train_loader):
@@ -677,15 +718,20 @@ def main() -> None:
                         samples=samples,
                         noise=noise,
                         condition_mask=condition_mask,
+                        compute_hidden_consistency=True,
                     )
+                    if output.hidden_consistency_mse is None:
+                        raise RuntimeError("hidden consistency MSE was not computed")
                     losses = _losses(
                         output.fields,
+                        output.hidden_consistency_mse,
                         target_means,
                         target_variances,
                         target_clouds,
                         initial,
                         loss_function,
                         mean_weight,
+                        hidden_consistency_weight,
                         float(schedule.noise_scale),
                     )
                 (losses["total"] / accumulation).backward()
@@ -721,6 +767,11 @@ def main() -> None:
                         global_step,
                     )
                     writer.add_scalar(
+                        "train/batch_hidden_consistency_mse",
+                        float(losses["hidden_consistency_mse"].detach()),
+                        global_step,
+                    )
+                    writer.add_scalar(
                         "train/diversity", float(losses["diversity"].detach()), global_step
                     )
                     writer.add_scalar("train/grad_norm", float(grad_norm), global_step)
@@ -753,6 +804,7 @@ def main() -> None:
                         f"ustat={float(losses['u_statistic'].detach()):.5f} "
                         f"mean_mse={float(losses['ensemble_mean_mse'].detach()):.5f} "
                         f"norm_mean={float(losses['normalized_mean_mse'].detach()):.5f} "
+                        f"hidden_mse={float(losses['hidden_consistency_mse'].detach()):.5f} "
                         f"diversity={float(losses['diversity'].detach()):.5f} "
                         f"grad={float(grad_norm):.3f} "
                         f"micro_speed={size * world_size / seconds:.1f}mol/s "
@@ -773,6 +825,7 @@ def main() -> None:
             samples,
             loss_function,
             mean_weight,
+            hidden_consistency_weight,
             config,
             device,
             seed + 100_003 + rank,

@@ -74,6 +74,7 @@ class AbsoluteTrajectoryRolloutOutput:
 
     fields: Tensor
     final_hidden: Tensor
+    hidden_consistency_mse: Tensor | None
     gate_means: Tensor
     update_rms: Tensor
     spatial_noise_energy: Tensor
@@ -813,6 +814,7 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
         noise: Tensor | None = None,
         condition_mask: Tensor | None = None,
         reencode_every: int | None = None,
+        compute_hidden_consistency: bool = False,
     ) -> AbsoluteTrajectoryRolloutOutput:
         if initial.ndim != 4 or initial.shape[1] != self.cloud.field_channels:
             raise ValueError("initial must have shape [B,C,H,W]")
@@ -859,6 +861,7 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
         gate_steps = []
         update_steps = []
         energy_steps = []
+        hidden_consistency_steps = []
         for step in range(steps):
             flat_hidden = hidden.reshape(batch * samples, height, width, self.cloud.dim)
             step_levels = levels[:, step][:, None].expand(-1, samples).reshape(-1)
@@ -883,6 +886,18 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
                 step_levels if self.use_level_conditioning else None,
             )
             decoded = self.cloud.decode_absolute(flat_hidden)
+            if compute_hidden_consistency:
+                # The re-encoded image is the manifold reference, not a second
+                # trainable route through which the consistency loss can be
+                # reduced.  The residual state alone is pulled toward E(D(h)).
+                with torch.no_grad():
+                    reencoded_hidden = self.cloud.encode_anchor(decoded.detach())
+                hidden_consistency_steps.append(
+                    (flat_hidden.float() - reencoded_hidden.float())
+                    .square()
+                    .mean(dim=(1, 2, 3))
+                    .reshape(batch, samples)
+                )
             hidden = flat_hidden.reshape(
                 batch, samples, height, width, self.cloud.dim
             )
@@ -915,6 +930,11 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
         return AbsoluteTrajectoryRolloutOutput(
             fields=torch.stack(decoded_steps, dim=1),
             final_hidden=hidden,
+            hidden_consistency_mse=(
+                torch.stack(hidden_consistency_steps, dim=1)
+                if hidden_consistency_steps
+                else None
+            ),
             gate_means=torch.stack(gate_steps, dim=1),
             update_rms=torch.stack(update_steps, dim=1),
             spatial_noise_energy=torch.stack(energy_steps, dim=1),
