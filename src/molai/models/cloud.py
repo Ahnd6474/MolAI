@@ -812,6 +812,7 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
         samples: int = 4,
         noise: Tensor | None = None,
         condition_mask: Tensor | None = None,
+        reencode_every: int | None = None,
     ) -> AbsoluteTrajectoryRolloutOutput:
         if initial.ndim != 4 or initial.shape[1] != self.cloud.field_channels:
             raise ValueError("initial must have shape [B,C,H,W]")
@@ -819,6 +820,8 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
             raise ValueError("condition_tokens must have shape [B,K,C]")
         if samples < 2:
             raise ValueError("samples must be at least two")
+        if reencode_every is not None and reencode_every < 1:
+            raise ValueError("reencode_every must be positive when provided")
         if condition_mask is not None and condition_mask.shape != condition_tokens.shape[:2]:
             raise ValueError("condition_mask must have shape [B,K]")
 
@@ -899,6 +902,15 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
             energy_steps.append(
                 energy.reshape(batch, samples, height, width)
             )
+            if (
+                reencode_every is not None
+                and (step + 1) % reencode_every == 0
+                and step + 1 < steps
+            ):
+                flat_hidden = self.cloud.encode_anchor(decoded)
+                hidden = flat_hidden.reshape(
+                    batch, samples, height, width, self.cloud.dim
+                )
 
         return AbsoluteTrajectoryRolloutOutput(
             fields=torch.stack(decoded_steps, dim=1),

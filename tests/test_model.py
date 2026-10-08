@@ -854,6 +854,47 @@ def test_absolute_trajectory_rollout_keeps_four_paths_for_every_step() -> None:
     assert cloud.state_update.gate_bias.grad is not None
 
 
+def test_absolute_trajectory_rollout_can_reencode_every_four_steps() -> None:
+    cloud = AbsoluteMolecularFieldCloud(
+        field_channels=1,
+        condition_dim=16,
+        dim=16,
+        heads=4,
+        condition_cross_depth=1,
+        noise_token_count=4,
+        noise_token_dim=8,
+        refine_depth=1,
+        cvt_kernel_sizes=(3, 3, 3),
+        cvt_grid_sizes=(4, 2, 1),
+        max_level=8,
+        decoder_dim=16,
+        gradient_checkpointing=False,
+    )
+    model = AbsoluteTrajectoryRolloutCloud(
+        cloud, intermediate_refine_depth=1, use_level_conditioning=False
+    ).eval()
+    encoder_calls = 0
+
+    def count_encoder_calls(_module: torch.nn.Module, _inputs: tuple[torch.Tensor, ...]) -> None:
+        nonlocal encoder_calls
+        encoder_calls += 1
+
+    handle = cloud.field_encoder.register_forward_pre_hook(count_encoder_calls)
+    with torch.no_grad():
+        output = model(
+            torch.randn(1, 1, 8, 8),
+            torch.randn(1, 5, 16),
+            torch.tensor([8, 7, 6, 5, 4, 3, 2, 1]),
+            samples=4,
+            noise=torch.randn(1, 8, 4, 4, 8),
+            reencode_every=4,
+        )
+    handle.remove()
+
+    assert output.fields.shape == (1, 8, 4, 1, 8, 8)
+    assert encoder_calls == 2
+
+
 def test_peak_embedding_is_affine_in_raw_intensity() -> None:
     embedding = PositionwiseAffinePeakEmbedding(
         dim=16,

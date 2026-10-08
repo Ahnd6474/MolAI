@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--paths", type=int, default=4)
+    parser.add_argument("--reencode-every", type=int)
     parser.add_argument("--seed", type=int, default=314159)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -122,6 +123,7 @@ def main() -> None:
             samples=args.paths,
             noise=noise,
             condition_mask=condition_mask,
+            reencode_every=args.reencode_every,
         )
 
     fields = output.fields[0].detach().float().cpu()
@@ -193,6 +195,7 @@ def main() -> None:
                 "sample_index": sample_index,
                 "smiles": str(item["smiles"]),
                 "seed": args.seed,
+                "reencode_every": args.reencode_every,
                 "levels": levels,
                 "metrics": metrics,
             },
