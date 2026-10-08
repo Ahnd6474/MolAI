@@ -94,9 +94,9 @@ absolute_hidden_rollout:
   # Validation keeps the hidden state continuous for longer to expose drift.
   validation_steps: 8
   random_samples: 4
-  batch_size_per_gpu: 6
+  batch_size_per_gpu: 12
   validation_batch_size_per_gpu: 1
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 2
   gradient_checkpointing: false
   intermediate_refine_depth: 6
   compile_rollout: false
