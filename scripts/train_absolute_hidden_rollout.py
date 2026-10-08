@@ -1,4 +1,4 @@
-"""Train four persistent random paths through a short hidden rollout.
+"""Train persistent random paths through a short hidden rollout.
 
 Every decoded step receives an empirical U-statistic target and an absolute
 ensemble-mean loss.  The model carries four independent random trajectories
@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compile-rollout",
         choices=("on", "off"),
-        help="compile the complete four-step rollout before DDP wrapping",
+        help="compile the complete training rollout before DDP wrapping",
     )
     parser.add_argument(
         "--compile-mode",
@@ -226,9 +226,10 @@ def _update_latest(path: Path, latest: Path) -> None:
     os.replace(temporary, latest)
 
 
-def _add_tensorboard_layout(writer: SummaryWriter, steps: int) -> None:
+def _add_tensorboard_layout(writer: SummaryWriter, validation_steps: int) -> None:
     step_tags = lambda metric: [
-        f"validation/step_{step}_{metric}" for step in range(1, steps + 1)
+        f"validation/step_{step}_{metric}"
+        for step in range(1, validation_steps + 1)
     ]
     writer.add_custom_scalars(
         {
@@ -272,7 +273,7 @@ def _add_tensorboard_layout(writer: SummaryWriter, steps: int) -> None:
                     ],
                 ],
             },
-            "03 Four-step validation": {
+            "03 Hidden rollout validation": {
                 "Total by step": ["Multiline", step_tags("total")],
                 "U-stat by step": ["Multiline", step_tags("u_statistic")],
                 "Mean MSE by step": ["Multiline", step_tags("mean_mse")],
@@ -318,7 +319,7 @@ def _save(
             "global_step": step,
             "config": config,
             "source_checkpoint": str(source_checkpoint),
-            "training_kind": "absolute-four-path-four-step-rollout-hidden-consistency",
+            "training_kind": "absolute-four-path-two-step-rollout-hidden-consistency",
         },
         temporary,
     )
@@ -486,11 +487,14 @@ def main() -> None:
     accumulation = args.accumulation_steps or int(options["gradient_accumulation_steps"])
     epochs = args.epochs or int(options["epochs"])
     steps = int(options["steps"])
+    validation_steps = int(options.get("validation_steps", steps))
     samples = int(options["random_samples"])
     mean_weight = float(options["ensemble_mean_mse_weight"])
     hidden_consistency_weight = float(options["hidden_consistency_mse_weight"])
-    if steps != 4:
-        raise ValueError("this experiment requires exactly four rollout steps")
+    if steps != 2:
+        raise ValueError("this experiment requires exactly two training rollout steps")
+    if validation_steps < steps:
+        raise ValueError("validation_steps must be at least the training step count")
     if samples < 2:
         raise ValueError("U-statistic requires at least two final random samples")
 
@@ -630,7 +634,7 @@ def main() -> None:
     if rank == 0:
         args.output.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(args.output / "tensorboard")
-        _add_tensorboard_layout(writer, steps)
+        _add_tensorboard_layout(writer, validation_steps)
         writer.add_text("run/config", f"```yaml\n{yaml.safe_dump(config, sort_keys=False)}```")
         (args.output / "architecture.json").write_text(
             json.dumps(
@@ -638,6 +642,7 @@ def main() -> None:
                     "source_checkpoint": str(args.checkpoint),
                     "source_epoch": int(source["epoch"]) + 1,
                     "rollout_steps": steps,
+                    "validation_rollout_steps": validation_steps,
                     "persistent_random_paths": samples,
                     "ensemble_mean_mse_weight": mean_weight,
                     "hidden_consistency_mse_weight": hidden_consistency_weight,
@@ -660,7 +665,8 @@ def main() -> None:
             f"validation={validation_sampler.selected_count:,} "
             f"batch/GPU={batch_size} accumulation={accumulation} "
             f"effective_batch={batch_size * world_size * accumulation} "
-            f"steps={steps} persistent_paths={samples} "
+            f"steps={steps} validation_steps={validation_steps} "
+            f"persistent_paths={samples} "
             f"excluded_long_ms={excluded_count:,}",
             flush=True,
         )
@@ -821,7 +827,7 @@ def main() -> None:
             condition_module,
             validation_loader,
             schedule,
-            steps,
+            validation_steps,
             samples,
             loss_function,
             mean_weight,

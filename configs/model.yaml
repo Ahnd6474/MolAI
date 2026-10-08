@@ -89,7 +89,10 @@ absolute_training:
 # MSE of their ensemble mean pins the conditional mean and spatial position.
 absolute_hidden_rollout:
   epochs: 12
-  steps: 4
+  # Each molecule follows one randomly sampled two-transition level path.
+  steps: 2
+  # Validation keeps the hidden state continuous for longer to expose drift.
+  validation_steps: 8
   random_samples: 4
   batch_size_per_gpu: 6
   validation_batch_size_per_gpu: 1
