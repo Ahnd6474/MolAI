@@ -209,6 +209,69 @@ def _update_latest(path: Path, latest: Path) -> None:
     os.replace(temporary, latest)
 
 
+def _add_tensorboard_layout(writer: SummaryWriter, steps: int) -> None:
+    step_tags = lambda metric: [
+        f"validation/step_{step}_{metric}" for step in range(1, steps + 1)
+    ]
+    writer.add_custom_scalars(
+        {
+            "01 Loss": {
+                "Batch objective": [
+                    "Multiline",
+                    [
+                        "train/batch_total",
+                        "train/batch_u_statistic",
+                        "train/batch_normalized_mean_mse",
+                    ],
+                ],
+                "Ensemble mean error": [
+                    "Multiline",
+                    [
+                        "train/batch_ensemble_mean_mse",
+                        "train/batch_normalized_mean_mse",
+                    ],
+                ],
+                "Epoch train vs validation": [
+                    "Multiline",
+                    ["train/epoch_total", "validation/total"],
+                ],
+            },
+            "02 Distribution": {
+                "Diversity": [
+                    "Multiline",
+                    ["train/diversity", "validation/diversity"],
+                ],
+                "Field RMS": [
+                    "Multiline",
+                    ["model/output_rms", "validation/output_rms", "validation/clean_rms"],
+                ],
+                "Validation objective": [
+                    "Multiline",
+                    [
+                        "validation/u_statistic",
+                        "validation/normalized_mean_mse",
+                    ],
+                ],
+            },
+            "03 Four-step validation": {
+                "Total by step": ["Multiline", step_tags("total")],
+                "U-stat by step": ["Multiline", step_tags("u_statistic")],
+                "Mean MSE by step": ["Multiline", step_tags("mean_mse")],
+            },
+            "04 Model dynamics": {
+                "Residual dynamics": [
+                    "Multiline",
+                    ["model/gate_mean", "model/update_rms", "model/output_rms"],
+                ],
+            },
+            "05 Optimization": {
+                "Gradient norm": ["Multiline", ["train/grad_norm"]],
+                "Learning rate": ["Multiline", ["train/learning_rate"]],
+            },
+        }
+    )
+
+
 def _save(
     output: Path,
     epoch: int,
@@ -528,6 +591,7 @@ def main() -> None:
     if rank == 0:
         args.output.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(args.output / "tensorboard")
+        _add_tensorboard_layout(writer, steps)
         writer.add_text("run/config", f"```yaml\n{yaml.safe_dump(config, sort_keys=False)}```")
         (args.output / "architecture.json").write_text(
             json.dumps(
