@@ -551,6 +551,7 @@ def main() -> None:
         lr=float(options["learning_rate"]),
         weight_decay=float(options["weight_decay"]),
         betas=(0.9, 0.95),
+        fused=device.type == "cuda",
     )
 
     peak_chunk_size = int(config["training"].get("peak_chunk_size", 256))

@@ -846,8 +846,8 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
         else:
             noise = noise.to(device=initial.device, dtype=initial.dtype)
 
-        hidden = self.cloud.encode_anchor(initial)
-        hidden = hidden[:, None].expand(-1, samples, -1, -1, -1)
+        anchor_hidden = self.cloud.encode_anchor(initial)
+        hidden = anchor_hidden[:, None].expand(-1, samples, -1, -1, -1)
         expanded_condition = torch.repeat_interleave(
             condition_tokens, samples, dim=0
         )
@@ -864,10 +864,29 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
         hidden_consistency_steps = []
         for step in range(steps):
             flat_hidden = hidden.reshape(batch * samples, height, width, self.cloud.dim)
-            step_levels = levels[:, step][:, None].expand(-1, samples).reshape(-1)
-            proposed, energy = self._condition_and_refine(
-                flat_hidden, expanded_condition, expanded_mask, step_levels
-            )
+            molecule_levels = levels[:, step]
+            step_levels = molecule_levels[:, None].expand(-1, samples).reshape(-1)
+            if step == 0:
+                # Every stochastic path has the same anchor until noise is
+                # injected.  Run the expensive MS cross-attention once per
+                # molecule, then branch, instead of repeating identical work
+                # for every random sample.
+                proposed, molecule_energy = self._condition_and_refine(
+                    anchor_hidden,
+                    condition_tokens,
+                    condition_mask,
+                    molecule_levels,
+                )
+                proposed = proposed[:, None].expand(
+                    -1, samples, -1, -1, -1
+                ).reshape(batch * samples, height, width, self.cloud.dim)
+                energy = molecule_energy[:, None].expand(
+                    -1, samples, -1, -1
+                ).reshape(batch * samples, height, width)
+            else:
+                proposed, energy = self._condition_and_refine(
+                    flat_hidden, expanded_condition, expanded_mask, step_levels
+                )
             proposed = self.cloud._run(
                 self.cloud.noise_attention,
                 proposed,

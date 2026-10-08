@@ -826,6 +826,16 @@ def test_absolute_trajectory_rollout_keeps_four_paths_for_every_step() -> None:
     )
     levels = torch.tensor([[8, 6, 4, 2], [7, 5, 3, 1]])
     noise = torch.randn(2, 4, 4, 4, 8)
+    condition_batch_sizes: list[int] = []
+
+    def record_condition_batch(
+        _module: torch.nn.Module, inputs: tuple[torch.Tensor, ...]
+    ) -> None:
+        condition_batch_sizes.append(inputs[0].shape[0])
+
+    handle = cloud.condition_blocks[0].register_forward_pre_hook(
+        record_condition_batch
+    )
 
     output = model(
         initial,
@@ -836,6 +846,7 @@ def test_absolute_trajectory_rollout_keeps_four_paths_for_every_step() -> None:
         condition_mask=mask,
         compute_hidden_consistency=True,
     )
+    handle.remove()
 
     assert output.fields.shape == (2, 4, 4, 1, 8, 8)
     assert output.final_hidden.shape == (2, 4, 8, 8, 16)
@@ -845,6 +856,7 @@ def test_absolute_trajectory_rollout_keeps_four_paths_for_every_step() -> None:
     assert output.gate_means.shape == (2, 4, 4)
     assert output.update_rms.shape == (2, 4, 4)
     assert output.spatial_noise_energy.shape == (2, 4, 4, 8, 8)
+    assert condition_batch_sizes == [2, 8, 8, 8]
     torch.testing.assert_close(
         output.fields.mean(dim=(-2, -1)),
         torch.zeros(2, 4, 4, 1),
