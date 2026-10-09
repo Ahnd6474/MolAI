@@ -164,8 +164,11 @@ def _losses(
     hidden_consistency_weight: float,
     noise_scale: float,
 ) -> dict[str, Tensor]:
-    if hidden_consistency_mse.shape != output_fields.shape[:3]:
-        raise ValueError("hidden consistency MSE must have shape [B,T,M]")
+    if (
+        hidden_consistency_mse.ndim != 3
+        or hidden_consistency_mse.shape[:2] != output_fields.shape[:2]
+    ):
+        raise ValueError("hidden consistency MSE must have shape [B,T,S]")
     step_totals = []
     step_u_statistics = []
     step_mean_mses = []
@@ -491,6 +494,7 @@ def main() -> None:
     samples = int(options["random_samples"])
     mean_weight = float(options["ensemble_mean_mse_weight"])
     hidden_consistency_weight = float(options["hidden_consistency_mse_weight"])
+    hidden_consistency_samples = int(options.get("hidden_consistency_samples", samples))
     if steps != 2:
         raise ValueError("this experiment requires exactly two training rollout steps")
     if validation_steps < steps:
@@ -647,6 +651,7 @@ def main() -> None:
                     "persistent_random_paths": samples,
                     "ensemble_mean_mse_weight": mean_weight,
                     "hidden_consistency_mse_weight": hidden_consistency_weight,
+                    "hidden_consistency_samples": hidden_consistency_samples,
                     "intermediate_refine_depth": intermediate_refine_depth,
                     "use_level_conditioning": False,
                     "compile_rollout": compile_rollout,
@@ -668,6 +673,7 @@ def main() -> None:
             f"effective_batch={batch_size * world_size * accumulation} "
             f"steps={steps} validation_steps={validation_steps} "
             f"persistent_paths={samples} "
+            f"hidden_consistency_paths={hidden_consistency_samples} "
             f"excluded_long_ms={excluded_count:,}",
             flush=True,
         )
@@ -726,6 +732,7 @@ def main() -> None:
                         noise=noise,
                         condition_mask=condition_mask,
                         compute_hidden_consistency=True,
+                        hidden_consistency_samples=hidden_consistency_samples,
                     )
                     if output.hidden_consistency_mse is None:
                         raise RuntimeError("hidden consistency MSE was not computed")

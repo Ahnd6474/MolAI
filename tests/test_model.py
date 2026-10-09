@@ -845,13 +845,14 @@ def test_absolute_trajectory_rollout_keeps_four_paths_for_every_step() -> None:
         noise=noise,
         condition_mask=mask,
         compute_hidden_consistency=True,
+        hidden_consistency_samples=1,
     )
     handle.remove()
 
     assert output.fields.shape == (2, 4, 4, 1, 8, 8)
     assert output.final_hidden.shape == (2, 4, 8, 8, 16)
     assert output.hidden_consistency_mse is not None
-    assert output.hidden_consistency_mse.shape == (2, 4, 4)
+    assert output.hidden_consistency_mse.shape == (2, 4, 1)
     assert output.hidden_consistency_mse.requires_grad
     assert output.gate_means.shape == (2, 4, 4)
     assert output.update_rms.shape == (2, 4, 4)

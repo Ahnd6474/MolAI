@@ -815,6 +815,7 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
         condition_mask: Tensor | None = None,
         reencode_every: int | None = None,
         compute_hidden_consistency: bool = False,
+        hidden_consistency_samples: int | None = None,
     ) -> AbsoluteTrajectoryRolloutOutput:
         if initial.ndim != 4 or initial.shape[1] != self.cloud.field_channels:
             raise ValueError("initial must have shape [B,C,H,W]")
@@ -824,6 +825,10 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
             raise ValueError("samples must be at least two")
         if reencode_every is not None and reencode_every < 1:
             raise ValueError("reencode_every must be positive when provided")
+        if hidden_consistency_samples is None:
+            hidden_consistency_samples = samples
+        if not 1 <= hidden_consistency_samples <= samples:
+            raise ValueError("hidden_consistency_samples must lie in [1, samples]")
         if condition_mask is not None and condition_mask.shape != condition_tokens.shape[:2]:
             raise ValueError("condition_mask must have shape [B,K]")
 
@@ -909,12 +914,32 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
                 # Optimize the complete fixed-point residual h - E(D(h)).
                 # Detaching E(D(h)) turns this into an expansive fixed-point
                 # iteration when the local encoder-decoder gain exceeds one.
-                reencoded_hidden = self.cloud.encode_anchor(decoded)
+                selected_hidden = flat_hidden.reshape(
+                    batch, samples, height, width, self.cloud.dim
+                )[:, :hidden_consistency_samples].reshape(
+                    batch * hidden_consistency_samples,
+                    height,
+                    width,
+                    self.cloud.dim,
+                )
+                selected_decoded = decoded.reshape(
+                    batch,
+                    samples,
+                    self.cloud.field_channels,
+                    height,
+                    width,
+                )[:, :hidden_consistency_samples].reshape(
+                    batch * hidden_consistency_samples,
+                    self.cloud.field_channels,
+                    height,
+                    width,
+                )
+                reencoded_hidden = self.cloud.encode_anchor(selected_decoded)
                 hidden_consistency_steps.append(
-                    (flat_hidden.float() - reencoded_hidden.float())
+                    (selected_hidden.float() - reencoded_hidden.float())
                     .square()
                     .mean(dim=(1, 2, 3))
-                    .reshape(batch, samples)
+                    .reshape(batch, hidden_consistency_samples)
                 )
             hidden = flat_hidden.reshape(
                 batch, samples, height, width, self.cloud.dim

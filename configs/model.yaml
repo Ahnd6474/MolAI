@@ -105,6 +105,9 @@ absolute_hidden_rollout:
   # Full-gradient fixed-point loss between every recurrent state and the field
   # encoder reading of its decoded image: MSE(h, E(D(h))).
   hidden_consistency_mse_weight: 0.1
+  # Random paths are exchangeable.  One path gives an unbiased consistency
+  # estimate while all four remain active for U-statistic and ensemble losses.
+  hidden_consistency_samples: 1
   learning_rate: 0.00001
   min_learning_rate: 0.000001
   warmup_steps: 100
