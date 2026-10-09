@@ -1,8 +1,8 @@
 """Train persistent random paths through a short hidden rollout.
 
-Every decoded step receives an empirical U-statistic target and an absolute
-ensemble-mean loss.  The model carries four independent random trajectories
-without using level embeddings.
+Every decoded step receives an empirical U-statistic target and full-gradient
+hidden/image consistency. Ensemble-mean error can be monitored without being
+optimized. Four independent random trajectories use no level embeddings.
 """
 
 from __future__ import annotations
@@ -180,26 +180,28 @@ def _losses(
         u_statistic = loss_function(
             predicted, target_clouds[:, step], initial
         )
-        predicted_mean = predicted.float().mean(dim=1)
-        squared_error = (predicted_mean - target_mean.float()).square().mean(
-            dim=(1, 2, 3)
-        )
-        target_energy = target_mean.float().square().mean(dim=(1, 2, 3))
-        target_energy = target_energy + noise_scale**2 * target_variances[:, step].float()
-        normalized_mean_mse = (
-            squared_error / target_energy.clamp_min(1e-4)
-        ).mean()
-        mean_mse = squared_error.mean()
+        # Disabled mean supervision is evaluated only as a detached diagnostic.
+        # Do not attach even a zero-weight mean loss to the objective graph.
+        with torch.set_grad_enabled(torch.is_grad_enabled() and mean_weight != 0.0):
+            predicted_mean = predicted.float().mean(dim=1)
+            squared_error = (predicted_mean - target_mean.float()).square().mean(
+                dim=(1, 2, 3)
+            )
+            target_energy = target_mean.float().square().mean(dim=(1, 2, 3))
+            target_energy = target_energy + noise_scale**2 * target_variances[:, step].float()
+            normalized_mean_mse = (
+                squared_error / target_energy.clamp_min(1e-4)
+            ).mean()
+            mean_mse = squared_error.mean()
         hidden_mse = hidden_consistency_mse[:, step].mean()
         step_u_statistics.append(u_statistic)
         step_mean_mses.append(mean_mse)
         step_normalized_mean_mses.append(normalized_mean_mse)
         step_hidden_consistency_mses.append(hidden_mse)
-        step_totals.append(
-            u_statistic
-            + mean_weight * normalized_mean_mse
-            + hidden_consistency_weight * hidden_mse
-        )
+        step_total = u_statistic + hidden_consistency_weight * hidden_mse
+        if mean_weight != 0.0:
+            step_total = step_total + mean_weight * normalized_mean_mse
+        step_totals.append(step_total)
 
     return {
         "total": torch.stack(step_totals).mean(),
@@ -242,11 +244,10 @@ def _add_tensorboard_layout(writer: SummaryWriter, validation_steps: int) -> Non
                     [
                         "train/batch_total",
                         "train/batch_u_statistic",
-                        "train/batch_normalized_mean_mse",
                         "train/batch_hidden_consistency_mse",
                     ],
                 ],
-                "Ensemble mean error": [
+                "Ensemble mean error (diagnostic)": [
                     "Multiline",
                     [
                         "train/batch_ensemble_mean_mse",
@@ -271,7 +272,6 @@ def _add_tensorboard_layout(writer: SummaryWriter, validation_steps: int) -> Non
                     "Multiline",
                     [
                         "validation/u_statistic",
-                        "validation/normalized_mean_mse",
                         "validation/hidden_consistency_mse",
                     ],
                 ],
@@ -645,6 +645,9 @@ def main() -> None:
             json.dumps(
                 {
                     "source_checkpoint": str(args.checkpoint),
+                    "resume_checkpoint": str(args.resume) if args.resume else None,
+                    "start_epoch": start_epoch + 1,
+                    "start_global_step": global_step,
                     "source_epoch": int(source["epoch"]) + 1,
                     "rollout_steps": steps,
                     "validation_rollout_steps": validation_steps,

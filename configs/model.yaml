@@ -84,9 +84,9 @@ absolute_training:
   # Exclude only the extreme ~0.1% tail after the two peak-pooling stages.
   max_postpool_peak_tokens: 8192
 
-# Four persistent random trajectories receive direct supervision at every
-# hidden step.  U-statistic matches the transition cloud while the normalized
-# MSE of their ensemble mean pins the conditional mean and spatial position.
+# Four persistent random trajectories receive U-statistic supervision at every
+# hidden step plus full-gradient hidden/image consistency. Ensemble-mean MSE
+# remains a diagnostic only, without its finite-sample variance penalty.
 absolute_hidden_rollout:
   epochs: 12
   # Each molecule follows one randomly sampled two-transition level path.
@@ -101,7 +101,7 @@ absolute_hidden_rollout:
   intermediate_refine_depth: 6
   compile_rollout: false
   compile_mode: default
-  ensemble_mean_mse_weight: 1.0
+  ensemble_mean_mse_weight: 0.0
   # Full-gradient fixed-point loss between every recurrent state and the field
   # encoder reading of its decoded image: MSE(h, E(D(h))).
   hidden_consistency_mse_weight: 0.1
