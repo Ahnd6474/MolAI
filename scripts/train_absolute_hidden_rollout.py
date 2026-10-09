@@ -319,7 +319,7 @@ def _save(
             "global_step": step,
             "config": config,
             "source_checkpoint": str(source_checkpoint),
-            "training_kind": "absolute-four-path-two-step-rollout-hidden-consistency",
+            "training_kind": "absolute-four-path-two-step-rollout-full-gradient-hidden-consistency",
         },
         temporary,
     )

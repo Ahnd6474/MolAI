@@ -102,8 +102,8 @@ absolute_hidden_rollout:
   compile_rollout: false
   compile_mode: default
   ensemble_mean_mse_weight: 1.0
-  # Keep every recurrent state on the manifold obtained by decoding it to an
-  # image and reading that generated image back through the field encoder.
+  # Full-gradient fixed-point loss between every recurrent state and the field
+  # encoder reading of its decoded image: MSE(h, E(D(h))).
   hidden_consistency_mse_weight: 0.1
   learning_rate: 0.00001
   min_learning_rate: 0.000001

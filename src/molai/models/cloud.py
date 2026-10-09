@@ -906,11 +906,10 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
             )
             decoded = self.cloud.decode_absolute(flat_hidden)
             if compute_hidden_consistency:
-                # The re-encoded image is the manifold reference, not a second
-                # trainable route through which the consistency loss can be
-                # reduced.  The residual state alone is pulled toward E(D(h)).
-                with torch.no_grad():
-                    reencoded_hidden = self.cloud.encode_anchor(decoded.detach())
+                # Optimize the complete fixed-point residual h - E(D(h)).
+                # Detaching E(D(h)) turns this into an expansive fixed-point
+                # iteration when the local encoder-decoder gain exceeds one.
+                reencoded_hidden = self.cloud.encode_anchor(decoded)
                 hidden_consistency_steps.append(
                     (flat_hidden.float() - reencoded_hidden.float())
                     .square()

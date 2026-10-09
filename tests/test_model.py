@@ -864,6 +864,12 @@ def test_absolute_trajectory_rollout_keeps_four_paths_for_every_step() -> None:
         rtol=0.0,
     )
 
+    decoder_gradient = torch.autograd.grad(
+        output.hidden_consistency_mse.mean(),
+        cloud.output_head.direct_projection.weight,
+        retain_graph=True,
+    )[0]
+    assert decoder_gradient.abs().sum() > 0
     (output.fields.square().mean() + output.hidden_consistency_mse.mean()).backward()
     assert condition.grad is not None
     assert cloud.field_encoder.input_projection.weight.grad is not None
