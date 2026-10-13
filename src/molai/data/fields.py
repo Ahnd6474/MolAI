@@ -220,6 +220,8 @@ class ShardShuffleSampler(Sampler[int]):
         split_seed: int = 17,
         shuffle: bool = True,
         eligible_mask: Tensor | None = None,
+        bucket_lengths: Tensor | None = None,
+        bucket_batches: int = 16,
     ) -> None:
         if replicas < 1 or not 0 <= rank < replicas:
             raise ValueError("rank must be in [0, replicas)")
@@ -238,6 +240,15 @@ class ShardShuffleSampler(Sampler[int]):
         self.rank = rank
         self.replicas = replicas
         self.shuffle = shuffle
+        self.batch_size = batch_size
+        self.bucket_batches = bucket_batches
+        self.bucket_lengths = None
+        if bucket_lengths is not None:
+            if batch_size is None or batch_size < 1 or bucket_batches < 1:
+                raise ValueError("length bucketing requires positive batch_size/bucket_batches")
+            if bucket_lengths.shape != (len(dataset),):
+                raise ValueError("bucket_lengths must have one value per dataset record")
+            self.bucket_lengths = bucket_lengths.cpu().tolist()
         self.epoch = 0
         self.local_indices: list[list[int]] = []
         start = 0
@@ -281,19 +292,62 @@ class ShardShuffleSampler(Sampler[int]):
         else:
             shard_order = list(range(len(self.dataset.shards)))
         indices: list[int] = []
+        pending: list[int] = []
         for shard_index in shard_order:
             shard_indices = self.local_indices[shard_index]
             if self.shuffle:
                 local_order = torch.randperm(len(shard_indices), generator=generator).tolist()
-                indices.extend(shard_indices[local_index] for local_index in local_order)
+                ordered = [shard_indices[local_index] for local_index in local_order]
             else:
-                indices.extend(shard_indices)
+                ordered = list(shard_indices)
+            if self.bucket_lengths is not None:
+                # Sort only small shuffled windows within one shard. Preserve
+                # the molecular split and visit every record, while matching
+                # MS sequence lengths both within and across DDP ranks.
+                global_batch = self.batch_size * self.replicas
+                if pending:
+                    needed = global_batch - len(pending)
+                    pending.extend(ordered[:needed])
+                    ordered = ordered[needed:]
+                    if len(pending) == global_batch:
+                        indices.extend(pending)
+                        pending = []
+                    else:
+                        continue
+                # Carry just the final incomplete global batch across shards;
+                # never shift all later DDP batches out of their buckets.
+                remainder = len(ordered) % global_batch
+                if remainder:
+                    pending = ordered[-remainder:]
+                    ordered = ordered[:-remainder]
+                window = global_batch * self.bucket_batches
+                for start in range(0, len(ordered), window):
+                    grouped = sorted(ordered[start:start + window], key=self.bucket_lengths.__getitem__)
+                    batches = [grouped[i:i + global_batch] for i in range(0, len(grouped), global_batch)]
+                    if self.shuffle:
+                        order = torch.randperm(len(batches), generator=generator).tolist()
+                        batches = [batches[i] for i in order]
+                    indices.extend(index for batch in batches for index in batch)
+            else:
+                indices.extend(ordered)
+
+        indices.extend(pending)
 
         total_size = self.samples_per_rank * self.replicas
         if len(indices) < total_size:
             missing = total_size - len(indices)
             repeats = (missing + len(indices) - 1) // len(indices)
             indices.extend((indices * repeats)[:missing])
+        if self.bucket_lengths is not None:
+            # Neighboring rank-sized blocks belong to the same length bucket;
+            # contiguous epoch-sized rank slices would destroy load balancing.
+            global_batch = self.batch_size * self.replicas
+            offset = self.rank * self.batch_size
+            return iter([
+                index
+                for start in range(0, total_size, global_batch)
+                for index in indices[start + offset:start + offset + self.batch_size]
+            ])
         rank_start = self.rank * self.samples_per_rank
         return iter(indices[rank_start : rank_start + self.samples_per_rank])
 

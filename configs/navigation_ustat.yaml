@@ -1,0 +1,42 @@
+# Fresh model/optimizer; Navigation geometry plus off-diagonal U-statistic.
+token_conditioning: true
+alignment_steps: 0
+alignment_learning_rate: 0.0001
+alignment_min_learning_rate: 0.00001
+max_postpool_peak_tokens: 8192
+length_bucket_batches: 16
+refine_depth: 3
+refine_gate_init: 0.1
+steps: 1
+validation_steps: 1
+validation_start_levels: uniform
+long_rollout_steps: 20
+long_rollout_samples: 4
+random_samples: 4
+batch_size_per_gpu: 16
+validation_batch_size_per_gpu: 4
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+compile_rollout: false
+compile_blocks: true
+compile_loss: true
+preserve_bf16_rounding: true
+cache_ms_kv: true
+packed_ms_kv: true
+uncheckpointed_refine_blocks: 2
+epochs: 12
+learning_rate: 0.0001
+min_learning_rate: 0.00001
+warmup_steps: 100
+weight_decay: 0.0001
+# Existing combined mode: current-input-conditioned next-level VP posterior.
+# Zero targets its posterior mean, not clean/current-level signal.
+# Random U-stat compares innovations about the analytic posterior mean.
+loss_name: navigation_ustat
+loss_mode: vp_transition_geometry
+u_statistic_weight: 1.0
+zero_mean_mse_weight: 1.0
+random_radius_weight: 1.0
+random_direction_weight: 1.0
+radius_use_token_rms: true
+log_every: 10

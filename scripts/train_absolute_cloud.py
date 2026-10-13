@@ -24,7 +24,7 @@ from train_cloud import _make_schedule, _sample_transition
 from molai.data import ShardShuffleSampler, SpectrumFieldDataset, collate_spectrum_field_batch
 from molai.models.bridge import CosineVPSchedule
 from molai.models.cloud import AbsoluteMolecularFieldCloud
-from molai.models.condition import SpectrumTokenEncoder
+from molai.models.condition import SpectrumTokenEncoder, bind_spectrum_metadata
 from molai.models.losses import FullBandEnergyDistance
 
 
@@ -109,6 +109,7 @@ def _build_condition_encoder(
         mz_upper_bound=float(options["mz_upper_bound"]),
         peak_chunk_size=int(config["training"].get("peak_chunk_size", 256)),
         peak_chunk_batch=int(options.get("peak_chunk_batch", 256)),
+        **bind_spectrum_metadata(options, dataset.manifest),
     ).to(device)
 
 

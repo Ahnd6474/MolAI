@@ -99,8 +99,12 @@ absolute_hidden_rollout:
   gradient_accumulation_steps: 2
   gradient_checkpointing: false
   intermediate_refine_depth: 6
-  compile_rollout: false
+  compile_rollout: true
   compile_mode: default
+  compile_loss: true
+  # Match MS lengths without truncating tokens or changing the molecular split.
+  # Each bucket window stays within a tensor shard to preserve disk locality.
+  length_bucket_batches: 16
   ensemble_mean_mse_weight: 0.0
   # Full-gradient fixed-point loss between every recurrent state and the field
   # encoder reading of its decoded image: MSE(h, E(D(h))).
@@ -145,6 +149,10 @@ training:
   log_every: 10
 
 spectrum_encoder:
+  # Peak Q reads seven per-spectrum acquisition K/V tokens before Conv/pool.
+  # Requires the CASMI v2 packed metadata schema; legacy checkpoints default to add.
+  metadata_fusion: preconv_cross
+  metadata_cross_gate_init: 0.1
   heads: 8
   peak_conv_stages: 2
   peak_conv_kernel_size: 5

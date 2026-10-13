@@ -294,6 +294,9 @@ def _add_tensorboard_layout(writer: SummaryWriter, validation_steps: int) -> Non
             "05 Optimization": {
                 "Gradient norm": ["Multiline", ["train/grad_norm"]],
                 "Learning rate": ["Multiline", ["train/learning_rate"]],
+                "Throughput (includes loading and accumulation)": [
+                    "Multiline", ["train/molecules_per_second"],
+                ],
             },
         }
     )
@@ -516,11 +519,15 @@ def main() -> None:
     eligible_mask = postpool_counts <= maximum_tokens
     excluded_count = int((~eligible_mask).sum())
 
-    source = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    # Keep checkpoint-only optimizer tensors off CUDA. load_state_dict copies
+    # the weights to the module; retaining the source must not reserve VRAM.
+    source = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    source_epoch = int(source["epoch"]) + 1
     cloud = _build_cloud(config, device)
     condition_encoder = _build_condition_encoder(dataset, config, device)
     cloud.load_state_dict(source["cloud"])
     condition_encoder.load_state_dict(source["condition_encoder"])
+    del source
     intermediate_refine_depth = (
         args.intermediate_refine_depth
         if args.intermediate_refine_depth is not None
@@ -548,6 +555,11 @@ def main() -> None:
             dynamic=True,
             mode=compile_mode,
         )
+    compile_loss = compile_rollout and bool(options.get("compile_loss", False))
+    loss_execution = (
+        torch.compile(_losses, fullgraph=True, dynamic=False)
+        if compile_loss else _losses
+    )
     condition_module = RaggedSpectrumTokenRunner(condition_encoder)
     parameters = [*rollout.parameters(), *condition_encoder.parameters()]
     optimizer = torch.optim.AdamW(
@@ -570,7 +582,10 @@ def main() -> None:
         "eligible_mask": eligible_mask,
     }
     train_sampler = ShardShuffleSampler(
-        dataset, split="train", shuffle=True, **sampler_options
+        dataset, split="train", shuffle=True,
+        bucket_lengths=(postpool_counts if int(options.get("length_bucket_batches", 0)) > 0 else None),
+        bucket_batches=max(1, int(options.get("length_bucket_batches", 0))),
+        **sampler_options,
     )
     validation_options = dict(sampler_options)
     validation_options["batch_size"] = validation_batch_size
@@ -610,13 +625,14 @@ def main() -> None:
     start_epoch = 0
     global_step = 0
     if args.resume is not None:
-        resumed = torch.load(args.resume, map_location=device, weights_only=False)
+        resumed = torch.load(args.resume, map_location="cpu", weights_only=False)
         cloud.load_state_dict(resumed["cloud"])
         condition_encoder.load_state_dict(resumed["condition_encoder"])
         optimizer.load_state_dict(resumed["optimizer"])
         scheduler.load_state_dict(resumed["scheduler"])
         start_epoch = int(resumed["epoch"]) + 1
         global_step = int(resumed["global_step"])
+        del resumed
 
     schedule = _make_schedule(dataset.manifest, config, device)
     if not isinstance(schedule, CosineVPSchedule):
@@ -648,7 +664,7 @@ def main() -> None:
                     "resume_checkpoint": str(args.resume) if args.resume else None,
                     "start_epoch": start_epoch + 1,
                     "start_global_step": global_step,
-                    "source_epoch": int(source["epoch"]) + 1,
+                    "source_epoch": source_epoch,
                     "rollout_steps": steps,
                     "validation_rollout_steps": validation_steps,
                     "persistent_random_paths": samples,
@@ -659,6 +675,8 @@ def main() -> None:
                     "use_level_conditioning": False,
                     "compile_rollout": compile_rollout,
                     "compile_mode": compile_mode,
+                    "compile_loss": compile_loss,
+                    "length_bucket_batches": int(options.get("length_bucket_batches", 0)),
                     "cloud_parameters": sum(value.numel() for value in cloud.parameters()),
                     "condition_parameters": sum(
                         value.numel() for value in condition_encoder.parameters()
@@ -698,6 +716,8 @@ def main() -> None:
             "hidden_consistency_mse": 0.0,
         }
         count = 0
+        throughput_started = time.perf_counter()
+        throughput_molecules = 0
         for micro_step, batch in enumerate(train_loader):
             if args.max_steps is not None and global_step >= args.max_steps:
                 stop = True
@@ -739,7 +759,7 @@ def main() -> None:
                     )
                     if output.hidden_consistency_mse is None:
                         raise RuntimeError("hidden consistency MSE was not computed")
-                    losses = _losses(
+                    losses = loss_execution(
                         output.fields,
                         output.hidden_consistency_mse,
                         target_means,
@@ -756,6 +776,7 @@ def main() -> None:
             for name in totals:
                 totals[name] += float(losses[name].detach()) * size
             count += size
+            throughput_molecules += size * world_size
             if should_step:
                 grad_norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0)
                 optimizer.step()
@@ -765,6 +786,8 @@ def main() -> None:
                 if rank == 0 and global_step % log_every == 0:
                     assert writer is not None
                     seconds = time.perf_counter() - started
+                    window_speed = throughput_molecules / (time.perf_counter() - throughput_started)
+                    writer.add_scalar("train/molecules_per_second", window_speed, global_step)
                     writer.add_scalar(
                         "train/batch_total", float(losses["total"].detach()), global_step
                     )
@@ -825,9 +848,12 @@ def main() -> None:
                         f"diversity={float(losses['diversity'].detach()):.5f} "
                         f"grad={float(grad_norm):.3f} "
                         f"micro_speed={size * world_size / seconds:.1f}mol/s "
+                        f"window_speed={window_speed:.1f}mol/s "
                         f"peak_mem={memory:.2f}GiB",
                         flush=True,
                     )
+                    throughput_started = time.perf_counter()
+                    throughput_molecules = 0
 
         train_means = {
             name: _distributed_mean(value, count, device)

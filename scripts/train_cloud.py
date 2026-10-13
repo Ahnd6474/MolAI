@@ -28,7 +28,11 @@ from molai.data import (
 )
 from molai.models.bridge import BridgeBatch, CosineVPSchedule, GeometricVESchedule, VPSchedule
 from molai.models.cloud import MolecularFieldCloud
-from molai.models.condition import SmilesConditionEncoder, SpectrumConditionEncoder
+from molai.models.condition import (
+    SmilesConditionEncoder,
+    SpectrumConditionEncoder,
+    bind_spectrum_metadata,
+)
 from molai.models.losses import FullBandEnergyDistance
 from molai.models.smiles import SmilesTokenizer
 
@@ -635,6 +639,7 @@ def main() -> None:
             mz_upper_bound=float(spectrum_config["mz_upper_bound"]),
             peak_chunk_size=peak_chunk_size,
             peak_chunk_batch=int(spectrum_config.get("peak_chunk_batch", 256)),
+            **bind_spectrum_metadata(spectrum_config, dataset.manifest),
         ).to(device)
         condition_module: nn.Module = RaggedSpectrumConditionRunner(condition_encoder)
     else:

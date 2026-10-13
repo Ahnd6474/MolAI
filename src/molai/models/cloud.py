@@ -107,6 +107,7 @@ class MolecularFieldCloud(nn.Module):
         noise_amplitude_max: float = 8.0,
         zero_mean_output: bool = False,
         gradient_checkpointing: bool = True,
+        refine_gate_init: float | None = None,
     ) -> None:
         super().__init__()
         if dim % heads or dim % 4:
@@ -166,6 +167,7 @@ class MolecularFieldCloud(nn.Module):
                     ffn_ratio,
                     kernel_sizes=cvt_kernel_sizes,
                     grid_sizes=cvt_grid_sizes,
+                    residual_gate_init=refine_gate_init,
                 )
                 for _ in range(refine_depth)
             ]
@@ -817,6 +819,16 @@ class AbsoluteTrajectoryRolloutCloud(AbsoluteHiddenRolloutCloud):
         compute_hidden_consistency: bool = False,
         hidden_consistency_samples: int | None = None,
     ) -> AbsoluteTrajectoryRolloutOutput:
+        if torch.compiler.is_compiling():
+            # Image/rollout dimensions are fixed; only the ragged MS length
+            # varies. Making H/W symbolic breaks Inductor's convolution view
+            # scheduling (CantSplit) and offers no benefit for this workload.
+            torch._dynamo.mark_static(initial)
+            torch._dynamo.mark_static(levels)
+            torch._dynamo.mark_static(condition_tokens, 0)
+            torch._dynamo.mark_static(condition_tokens, 2)
+            if noise is not None:
+                torch._dynamo.mark_static(noise)
         if initial.ndim != 4 or initial.shape[1] != self.cloud.field_channels:
             raise ValueError("initial must have shape [B,C,H,W]")
         if condition_tokens.ndim != 3 or condition_tokens.shape[0] != initial.shape[0]:

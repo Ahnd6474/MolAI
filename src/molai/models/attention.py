@@ -379,6 +379,70 @@ class TokenCrossBlock2d(nn.Module):
             nn.Linear(hidden, dim),
         )
 
+    def project_context(self, context: Tensor) -> tuple[Tensor, Tensor]:
+        """Project shared MS K/V once; keep their gradients across rollout steps."""
+        context = self.context_norm(context)
+        attention = self.attention
+        dim = attention.embed_dim
+        if attention.in_proj_weight is not None:
+            bias = None if attention.in_proj_bias is None else attention.in_proj_bias[dim:]
+            key, value = F.linear(context, attention.in_proj_weight[dim:], bias).chunk(2, dim=-1)
+        else:
+            key_weight, value_weight = attention.k_proj_weight, attention.v_proj_weight
+            key_bias = None if attention.in_proj_bias is None else attention.in_proj_bias[dim:2 * dim]
+            value_bias = None if attention.in_proj_bias is None else attention.in_proj_bias[2 * dim:]
+            key = F.linear(context, key_weight, key_bias)
+            value = F.linear(context, value_weight, value_bias)
+        shape = (*context.shape[:2], attention.num_heads, dim // attention.num_heads)
+        return key.reshape(shape).transpose(1, 2), value.reshape(shape).transpose(1, 2)
+
+    def forward_projected(
+        self, query: Tensor, key: Tensor, value: Tensor, context_mask: Tensor,
+    ) -> Tensor:
+        """Group independent image paths as queries without repeating MS memory."""
+        batch, height, width, dim = query.shape
+        context_batch = key.shape[0]
+        if batch % context_batch:
+            raise ValueError("image paths must be grouped by their MS owner")
+        attention = self.attention
+        query_weight = (attention.in_proj_weight[:dim] if attention.in_proj_weight is not None
+                        else attention.q_proj_weight)
+        query_bias = None if attention.in_proj_bias is None else attention.in_proj_bias[:dim]
+        projected_query = F.linear(self.query_norm(query), query_weight, query_bias)
+        projected_query = projected_query.reshape(context_batch, -1, attention.num_heads,
+                                                   dim // attention.num_heads).transpose(1, 2)
+        update = F.scaled_dot_product_attention(
+            projected_query, key, value, attn_mask=context_mask[:, None, None, :].bool(),
+            dropout_p=attention.dropout if self.training else 0.0,
+        )
+        update = update.transpose(1, 2).reshape(batch, height, width, dim)
+        update = attention.out_proj(update)
+        query = query + torch.sigmoid(self.gate_projection(update)) * update
+        return query + self.ff(query)
+
+    def forward_varlen(
+        self, query: Tensor, key: Tensor, value: Tensor, cu_seq_k: Tensor, max_k: int,
+    ) -> Tensor:
+        """Exact non-padding MS attention via PyTorch's autograd-enabled Flash API."""
+        from torch.nn.attention.varlen import varlen_attn
+
+        attention = self.attention
+        if attention.dropout:
+            raise ValueError("packed condition attention requires zero attention dropout")
+        batch, height, width, dim = query.shape
+        owners = cu_seq_k.shape[0] - 1
+        query_length = (batch // owners) * height * width
+        query_weight = (attention.in_proj_weight[:dim] if attention.in_proj_weight is not None
+                        else attention.q_proj_weight)
+        query_bias = None if attention.in_proj_bias is None else attention.in_proj_bias[:dim]
+        projected_query = F.linear(self.query_norm(query), query_weight, query_bias)
+        projected_query = projected_query.reshape(-1, attention.num_heads, dim // attention.num_heads)
+        cu_seq_q = torch.arange(owners + 1, dtype=torch.int32, device=query.device) * query_length
+        update = varlen_attn(projected_query, key, value, cu_seq_q, cu_seq_k, query_length, max_k)
+        update = attention.out_proj(update.reshape(batch, height, width, dim))
+        query = query + torch.sigmoid(self.gate_projection(update)) * update
+        return query + self.ff(query)
+
     def forward(
         self,
         query: Tensor,
@@ -415,6 +479,7 @@ class CvTMixerBlock(nn.Module):
         ffn_ratio: float = 2.0,
         kernel_sizes: list[int] | tuple[int, ...] = (3, 5, 7),
         grid_sizes: list[int] | tuple[int, ...] = (8, 4, 2),
+        residual_gate_init: float | None = None,
     ) -> None:
         super().__init__()
         hidden = max(dim, round(dim * ffn_ratio))
@@ -426,10 +491,24 @@ class CvTMixerBlock(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, dim),
         )
+        if residual_gate_init is not None and not math.isfinite(residual_gate_init):
+            raise ValueError("residual_gate_init must be finite")
+        # None preserves historical checkpoint keys and the exact ungated path.
+        # Each branch/block owns an independent, signed learnable scalar.
+        self.register_parameter("attention_gate", None if residual_gate_init is None
+                                else nn.Parameter(torch.tensor(float(residual_gate_init))))
+        self.register_parameter("ffn_gate", None if residual_gate_init is None
+                                else nn.Parameter(torch.tensor(float(residual_gate_init))))
 
     def forward(self, tokens: Tensor) -> Tensor:
-        tokens = tokens + self.attention(self.norm(tokens))
-        return tokens + self.ff(tokens)
+        attention_update = self.attention(self.norm(tokens))
+        if self.attention_gate is not None:
+            attention_update = self.attention_gate * attention_update
+        tokens = tokens + attention_update
+        ffn_update = self.ff(tokens)
+        if self.ffn_gate is not None:
+            ffn_update = self.ffn_gate * ffn_update
+        return tokens + ffn_update
 
 
 class RandomMemoryAttention(nn.Module):

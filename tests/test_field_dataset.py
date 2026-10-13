@@ -141,6 +141,42 @@ def test_shard_sampler_pads_each_rank_to_full_batches(tmp_path) -> None:
     assert len(combined) - len(set(combined)) == 7
 
 
+def test_length_buckets_keep_coverage_and_reduce_ddp_padding() -> None:
+    class Dataset:
+        def __init__(self):
+            self.ends = [480, 960]
+            self.shards = [{}, {}]
+
+        def __len__(self):
+            return self.ends[-1]
+
+    dataset = Dataset()
+    lengths = torch.arange(960) % 120 + 1
+    lengths = lengths[torch.randperm(960, generator=torch.Generator().manual_seed(9))]
+    baseline = []
+    bucketed = []
+    for rank in range(2):
+        options = {"seed": 11, "replicas": 2, "rank": rank, "batch_size": 8}
+        baseline.append(list(ShardShuffleSampler(dataset, **options)))
+        sampler = ShardShuffleSampler(dataset, bucket_lengths=lengths, **options)
+        bucketed.append(list(sampler))
+        assert list(sampler) == bucketed[-1]
+        sampler.set_epoch(1)
+        assert list(sampler) != bucketed[-1]
+    assert sorted(bucketed[0] + bucketed[1]) == list(range(960))
+
+    def padded_cost(indices):
+        return sum(
+            max(int(lengths[i]) for rank in indices for i in rank[start:start + 8]) * 16
+            for start in range(0, len(indices[0]), 8)
+        )
+
+    assert padded_cost(bucketed) < 0.7 * padded_cost(baseline)
+    for rank in bucketed:
+        shard_ids = [index // 480 for index in rank]
+        assert sum(a != b for a, b in pairwise(shard_ids)) == 1
+
+
 def test_shard_sampler_molecule_split_is_disjoint(tmp_path) -> None:
     records = 100
     torch.save(
@@ -175,6 +211,30 @@ def test_shard_sampler_molecule_split_is_disjoint(tmp_path) -> None:
     assert train_indices.isdisjoint(validation_indices)
     assert train_indices | validation_indices == set(range(records))
     assert 10 <= len(validation_indices) <= 30
+
+
+def test_length_buckets_carry_partial_batches_across_tiny_shards() -> None:
+    class Dataset:
+        def __init__(self):
+            self.ends = [5, 7, 11, 17]
+            self.shards = [{} for _ in self.ends]
+
+        def __len__(self):
+            return self.ends[-1]
+
+    dataset = Dataset()
+    eligible = torch.arange(17) % 3 != 0
+    combined = []
+    for rank in range(3):
+        sampler = ShardShuffleSampler(
+            dataset, rank=rank, replicas=3, batch_size=4,
+            eligible_mask=eligible, bucket_lengths=torch.arange(17),
+        )
+        indices = list(sampler)
+        assert len(indices) == len(sampler) == 4
+        combined.extend(indices)
+    assert set(combined) == set(torch.nonzero(eligible).flatten().tolist())
+    assert len(combined) == 12
 
 
 def test_shard_sampler_excludes_ineligible_records(tmp_path) -> None:

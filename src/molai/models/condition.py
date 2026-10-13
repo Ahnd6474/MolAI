@@ -301,6 +301,106 @@ class SetSelfAttentionBlock(nn.Module):
         return tokens.masked_fill(~mask.unsqueeze(-1), 0.0)
 
 
+def bind_spectrum_metadata(options: dict, manifest: dict) -> dict:
+    """Bind typed metadata to the saved model config, rejecting legacy/leaky inputs."""
+    mode = options.get("metadata_fusion", "add")
+    names = None
+    if mode == "preconv_cross":
+        if manifest.get("metadata_schema", {}).get("format") != "casmi-acquisition-metadata-v2":
+            raise ValueError("preconv_cross requires a repacked CASMI v2 metadata dataset")
+        names = list(manifest["metadata_features"])
+        if len(names) != int(manifest["metadata_dim"]):
+            raise ValueError("metadata feature names do not match metadata_dim")
+        saved = options.get("metadata_feature_names")
+        if saved is not None and list(saved) != names:
+            raise ValueError("dataset metadata feature order differs from the saved encoder schema")
+        # Checkpoints must carry the exact feature order needed to rebuild typed K/V.
+        options["metadata_feature_names"] = names
+    return {"metadata_fusion": mode,
+            "metadata_cross_gate_init": float(options.get("metadata_cross_gate_init", 0.1)),
+            "metadata_feature_names": names}
+
+
+class AcquisitionMetadataTokens(nn.Module):
+    """Encode distinct measurement types, not one globally pooled K/V token."""
+
+    group_names = ("polarity", "adduct", "precursor", "instrument", "collision_ev",
+                   "collision_original", "intensity")
+
+    def __init__(self, feature_names: list[str], dim: int) -> None:
+        super().__init__()
+        groups: list[list[int]] = [[] for _ in self.group_names]
+        for index, name in enumerate(feature_names):
+            if name.startswith("ionization_mode:"):
+                group = "polarity"
+            elif name.startswith(("adduct:", "adduct_")):
+                group = "adduct"
+            elif name in {"precursor_mz_over_1000", "precursor_mz_present"}:
+                group = "precursor"
+            elif name.startswith("instrument_type:"):
+                group = "instrument"
+            elif name.startswith("collision_ev_"):
+                group = "collision_ev"
+            elif name.startswith(("collision_orig_", "collision_energy_orig_units:")):
+                group = "collision_original"
+            elif name in {"log1p_base_peak_intensity", "base_peak_intensity_present",
+                          "log1p_peak_count"}:
+                group = "intensity"
+            else:
+                raise ValueError(f"unrecognized acquisition metadata feature: {name}")
+            groups[self.group_names.index(group)].append(index)
+        if len(set(feature_names)) != len(feature_names) or any(not group for group in groups):
+            raise ValueError("typed acquisition metadata requires unique features in all seven groups")
+        self.projections = nn.ModuleList([
+            nn.Sequential(nn.Linear(len(group), dim), nn.SiLU(), nn.Linear(dim, dim))
+            for group in groups
+        ])
+        for index, group in enumerate(groups):
+            self.register_buffer(f"indices_{index}", torch.tensor(group), persistent=False)
+        self.type_embedding = nn.Parameter(torch.randn(len(groups), dim) * 0.02)
+        precursor_mask = torch.zeros(1, len(groups), 1)
+        precursor_mask[:, self.group_names.index("precursor")] = 1
+        self.register_buffer("precursor_mask", precursor_mask, persistent=False)
+
+    def forward(self, metadata: Tensor, precursor_token: Tensor) -> Tensor:
+        tokens = torch.stack([
+            projection(metadata.index_select(-1, getattr(self, f"indices_{index}")))
+            for index, projection in enumerate(self.projections)
+        ], dim=1)
+        return tokens + self.type_embedding[None] + self.precursor_mask * precursor_token[:, None]
+
+
+class PeakMetadataCrossAttention(nn.Module):
+    """Pre-norm peak-Q / acquisition-K,V cross with a signed scalar residual gate."""
+
+    def __init__(self, dim: int, heads: int, dropout: float, gate_init: float) -> None:
+        super().__init__()
+        if not math.isfinite(gate_init):
+            raise ValueError("metadata cross gate must be finite")
+        self.heads, self.head_dim, self.dropout = heads, dim // heads, dropout
+        self.query_norm = nn.LayerNorm(dim)
+        self.context_norm = nn.LayerNorm(dim)
+        self.query = nn.Linear(dim, dim)
+        self.key_value = nn.Linear(dim, 2 * dim)
+        self.output = nn.Linear(dim, dim)
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def project_context(self, memory: Tensor) -> tuple[Tensor, Tensor]:
+        # Once per spectrum, shared by all chunks without detaching gradients.
+        key, value = self.key_value(self.context_norm(memory)).chunk(2, dim=-1)
+        shape = (*memory.shape[:2], self.heads, self.head_dim)
+        return key.reshape(shape).transpose(1, 2), value.reshape(shape).transpose(1, 2)
+
+    def forward(self, peaks: Tensor, mask: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        query = self.query(self.query_norm(peaks))
+        query = query.reshape(*peaks.shape[:2], self.heads, self.head_dim).transpose(1, 2)
+        update = F.scaled_dot_product_attention(
+            query, key, value, dropout_p=self.dropout if self.training else 0.0,
+        )
+        update = self.output(update.transpose(1, 2).reshape_as(peaks))
+        return (peaks + self.gate * update).masked_fill(~mask.unsqueeze(-1), 0.0)
+
+
 class SpectrumConditionEncoder(nn.Module):
     """Distance-aware sparse CNN followed by compressed spectrum attention."""
 
@@ -322,6 +422,9 @@ class SpectrumConditionEncoder(nn.Module):
         mz_upper_bound: float = 5_000.0,
         peak_chunk_size: int = 256,
         peak_chunk_batch: int = 256,
+        metadata_fusion: str = "add",
+        metadata_cross_gate_init: float = 0.1,
+        metadata_feature_names: list[str] | None = None,
     ) -> None:
         super().__init__()
         if dim % heads:
@@ -337,17 +440,27 @@ class SpectrumConditionEncoder(nn.Module):
         self.mz_upper_bound = mz_upper_bound
         self.spectrum_ffn_ratio = ffn_ratio
         self.spectrum_dropout = dropout
+        if metadata_fusion not in {"add", "preconv_cross"}:
+            raise ValueError("metadata_fusion must be add or preconv_cross")
+        self.metadata_fusion = metadata_fusion
         self.peak_embedding = PositionwiseAffinePeakEmbedding(
             dim,
             position_dim=peak_position_dim,
             mz_bin_width=mz_bin_width,
             mz_upper_bound=mz_upper_bound,
         )
-        self.metadata_embedding = nn.Sequential(
-            nn.Linear(metadata_dim, dim),
-            nn.SiLU(),
-            nn.Linear(dim, dim),
-        )
+        if metadata_fusion == "preconv_cross":
+            if metadata_feature_names is None or len(metadata_feature_names) != metadata_dim:
+                raise ValueError("preconv_cross requires exact typed metadata_feature_names")
+            self.metadata_tokenizer = AcquisitionMetadataTokens(metadata_feature_names, dim)
+            self.metadata_cross = PeakMetadataCrossAttention(
+                dim, heads, dropout, metadata_cross_gate_init,
+            )
+        else:
+            # Keep historical checkpoints numerically and structurally unchanged.
+            self.metadata_embedding = nn.Sequential(
+                nn.Linear(metadata_dim, dim), nn.SiLU(), nn.Linear(dim, dim),
+            )
         self.precursor_embedding = nn.Sequential(
             nn.Linear(1, dim),
             nn.SiLU(),
@@ -522,12 +635,16 @@ class SpectrumConditionEncoder(nn.Module):
         precursor_mz = torch.nan_to_num(
             precursor_mz, nan=0.0, posinf=self.mz_upper_bound, neginf=0.0
         )
-        metadata_tokens = self.metadata_embedding(metadata)
         precursor_feature = torch.log1p(precursor_mz.clamp_min(0.0))
         precursor_feature = precursor_feature / math.log1p(self.mz_upper_bound)
-        metadata_tokens = metadata_tokens + self.precursor_embedding(
-            precursor_feature.unsqueeze(-1)
-        )
+        precursor_token = self.precursor_embedding(precursor_feature.unsqueeze(-1))
+        if self.metadata_fusion == "preconv_cross":
+            memory = self.metadata_tokenizer(metadata, precursor_token)
+            metadata_key, metadata_value = self.metadata_cross.project_context(memory)
+            # No additive metadata bypass, including in the legacy pooled-vector API.
+            metadata_tokens = torch.zeros_like(precursor_token)
+        else:
+            metadata_tokens = self.metadata_embedding(metadata) + precursor_token
         compressed_parts: list[Tensor] = []
         compressed_segment_parts: list[Tensor] = []
         for start in range(0, len(peak_chunks), self.peak_chunk_batch):
@@ -541,8 +658,13 @@ class SpectrumConditionEncoder(nn.Module):
             intensity = torch.nan_to_num(
                 chunk_slice[..., 1], nan=0.0, posinf=1.0, neginf=0.0
             )
-            chunk_metadata = metadata_tokens[mapping_slice]
-            tokens = self.peak_embedding(mz, intensity) + chunk_metadata[:, None]
+            tokens = self.peak_embedding(mz, intensity)
+            if self.metadata_fusion == "preconv_cross":
+                tokens = self.metadata_cross(
+                    tokens, mask_slice, metadata_key[mapping_slice], metadata_value[mapping_slice],
+                )
+            else:
+                tokens = tokens + metadata_tokens[mapping_slice, None]
             lower_mz = mz
             upper_mz = mz
             token_mask = mask_slice
@@ -642,17 +764,15 @@ class SpectrumTokenEncoder(SpectrumConditionEncoder):
             maximum,
             compressed.shape[-1],
         )
-        mask = torch.zeros(
-            molecule_count,
-            maximum,
-            dtype=torch.bool,
-            device=compressed.device,
-        )
-        for molecule in range(molecule_count):
-            molecule_tokens = compressed[peak_to_molecule == molecule]
-            count = molecule_tokens.shape[0]
-            padded[molecule, :count] = molecule_tokens
-            mask[molecule, :count] = True
+        # One stable grouped scatter replaces one dynamic boolean selection
+        # (and CUDA synchronization for its output size) per molecule. Stable
+        # ordering also handles interleaved spectra without changing tokens.
+        order = torch.argsort(peak_to_molecule, stable=True)
+        owners = peak_to_molecule[order]
+        starts = counts.cumsum(0) - counts
+        positions = torch.arange(len(compressed), device=compressed.device) - starts[owners]
+        padded[owners, positions] = compressed[order]
+        mask = torch.arange(maximum, device=compressed.device)[None] < counts[:, None]
         for block in self.spectrum_attention_blocks:
             padded = block(padded, mask)
         padded = self.output(padded)

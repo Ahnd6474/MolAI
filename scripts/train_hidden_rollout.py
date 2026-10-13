@@ -32,7 +32,7 @@ from train_cloud import (
 
 from molai.data import ShardShuffleSampler, SpectrumFieldDataset, collate_spectrum_field_batch
 from molai.models.cloud import HiddenRolloutCloud, MolecularFieldCloud
-from molai.models.condition import SpectrumConditionEncoder
+from molai.models.condition import SpectrumConditionEncoder, bind_spectrum_metadata
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,6 +101,7 @@ def _build_condition_encoder(
         mz_upper_bound=float(options["mz_upper_bound"]),
         peak_chunk_size=peak_chunk_size,
         peak_chunk_batch=int(options.get("peak_chunk_batch", 256)),
+        **bind_spectrum_metadata(options, dataset.manifest),
     ).to(device)
 
 

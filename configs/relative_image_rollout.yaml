@@ -1,0 +1,47 @@
+# Navigation experiment: randomly initialize the relative image/token model.
+token_conditioning: true
+alignment_steps: 0
+alignment_learning_rate: 0.0001
+alignment_min_learning_rate: 0.00001
+max_postpool_peak_tokens: 8192
+length_bucket_batches: 16
+refine_depth: 3
+# Independent signed scalar gates for Attention and FFN in each refine block.
+# Opt-in is saved in model config; historical checkpoints remain ungated.
+refine_gate_init: 0.1
+steps: 1
+validation_steps: 1
+validation_start_levels: uniform
+# Only these fixed rank-0 molecules get a long, visualization-only rollout.
+long_rollout_steps: 20
+long_rollout_samples: 4
+random_samples: 4
+batch_size_per_gpu: 16
+validation_batch_size_per_gpu: 4
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+compile_rollout: false
+# Compile reusable blocks, not a memory-heavy unrolled graph.
+compile_blocks: true
+compile_loss: true
+preserve_bf16_rounding: true
+# One shared differentiable MS K/V projection per condition block and rollout.
+cache_ms_kv: true
+packed_ms_kv: true
+# Preserve the existing execution optimization with the reduced refine depth.
+uncheckpointed_refine_blocks: 2
+epochs: 12
+learning_rate: 0.0001
+min_learning_rate: 0.00001
+warmup_steps: 100
+weight_decay: 0.0001
+# Zero denoises this level: sqrt(alpha_before)*clean, NOT clean or next mean.
+# One-step training avoids feeding this current-level probe to a later level.
+# Random matches the next global VP marginal, not an input-conditioned posterior.
+# Exactly two terms; U-stat provides target attraction and sample separation.
+loss_name: zero_current_global_vp_ustat
+loss_mode: zero_current_global_vp_ustat
+zero_current_mean_mse_weight: 1.0
+u_statistic_weight: 1.0
+# No radius, bound, direction, or separate repulsion loss is computed.
+log_every: 10

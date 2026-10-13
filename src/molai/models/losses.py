@@ -85,6 +85,10 @@ class FullBandEnergyDistance(nn.Module):
     The default U-statistic excludes self-pairs from the within-cloud terms. This
     removes the finite-sample diversity shrinkage of the V-statistic, which is
     especially large for the small sample clouds used during training.
+
+    Distances average scalar Charbonnier differences at each band/pixel. Thus
+    matching this score is not a certificate of the full joint spatial law, nor
+    of a conditional law when samples from different parent states are pooled.
     """
 
     def __init__(
@@ -122,3 +126,89 @@ class FullBandEnergyDistance(nn.Module):
             )
             loss = loss - within_target
         return loss
+
+
+def vp_cloud_geometry_losses(
+    fields: Tensor,
+    target_mean: Tensor,
+    posterior_noise_rms: Tensor,
+    random_tokens: Tensor,
+    *,
+    token_scaled_radius: bool = True,
+) -> dict[str, Tensor]:
+    """Geometry terms of Navigation loss for per-input VP stochastic innovations.
+
+    ``fields`` and per-path means are [B,T,1+M,C,H,W]; a shared mean of shape
+    [B,T,C,H,W] is also accepted for single-input callers. Posterior noise RMS
+    is [B,T]. Tokens are the *actual current-step* Random inputs [B,T,M,K,R].
+    Each innovation is output minus its own input-conditioned posterior mean,
+    equivalently (output-input) minus the analytic posterior drift. Past token
+    histories are not used to supervise a new step's stochastic direction.
+
+    Radius is measured about the analytic target mean, never a movable predicted
+    center. Each current token RMS has E[r**2]=1 for standard Gaussian tokens.
+    This is a geometry regularizer, not a full distribution-matching objective.
+    No ensemble centering or antithetic sampling changes the independent Random
+    tokens. This does not certify conditional output diversity: pooled parents
+    can contribute apparent innovation diversity without use of fresh tokens.
+    Clean/zero-variance targets have zero radius and no angle loss. At exactly
+    zero offsets both radius and angle gradients can vanish despite positive loss.
+    """
+    if fields.ndim != 6 or target_mean.shape not in (
+        fields.shape, fields.shape[:2] + fields.shape[3:],
+    ):
+        raise ValueError("fields must be [B,T,1+M,C,H,W]; target_mean must match or share [B,T,C,H,W]")
+    batch, steps, paths = fields.shape[:3]
+    samples = paths - 1
+    if samples < 2 or posterior_noise_rms.shape != (batch, steps):
+        raise ValueError("geometry requires M>=2 and posterior_noise_rms [B,T]")
+    if random_tokens.ndim != 5 or random_tokens.shape[:3] != (batch, steps, samples):
+        raise ValueError("random_tokens must have shape [B,T,M,K,R], excluding Zero")
+
+    # FP32 reductions/Gram matrices remain FP32 even under the trainer's autocast.
+    with torch.autocast(device_type=fields.device.type, enabled=False):
+        mean = target_mean.detach().float()
+        if mean.ndim == 5:
+            mean = mean[:, :, None].expand_as(fields)
+        sigma = posterior_noise_rms.detach().float()
+        offsets = (fields[:, :, 1:].float() - mean[:, :, 1:]).flatten(3)
+        zero_errors = (fields[:, :, 0].float() - mean[:, :, 0]).square()
+        step_zero = zero_errors.mean(dim=(0, 2, 3, 4))
+
+        tokens = random_tokens.detach().float().flatten(3)
+        token_gram = torch.einsum("btid,btjd->btij", tokens, tokens)
+        token_square = token_gram.diagonal(dim1=-2, dim2=-1).clamp_min(0)
+        token_rms = (token_square / tokens.shape[-1]).sqrt()
+        target_radius = sigma[:, :, None].expand(-1, -1, samples)
+        if token_scaled_radius:
+            target_radius = target_radius * token_rms
+
+        # An exact zero with finite derivative at clean/collapsed predictions.
+        epsilon = 1e-6
+        offset_rms = (offsets.square().mean(dim=-1) + epsilon**2).sqrt() - epsilon
+        step_radius = (offset_rms - target_radius).square().mean(dim=(0, 2))
+
+        output_direction = F.normalize(offsets, dim=-1, eps=epsilon)
+        output_cosine = torch.einsum("btid,btjd->btij", output_direction, output_direction)
+        token_norm = token_square.sqrt().clamp_min(epsilon)
+        token_cosine = token_gram / (token_norm[..., :, None] * token_norm[..., None, :])
+        off_diagonal = ~torch.eye(samples, device=fields.device, dtype=torch.bool)
+        active = (sigma > 0)[:, :, None, None] & off_diagonal[None, None]
+        nonzero_token = token_square > epsilon**2
+        active = active & nonzero_token[..., :, None] & nonzero_token[..., None, :]
+        angle_error = (output_cosine - token_cosine.clamp(-1, 1)).square()
+        step_direction = (angle_error * active).sum(dim=(0, 2, 3)) / active.sum(
+            dim=(0, 2, 3)
+        ).clamp_min(1)
+
+        return {
+            "zero_mean_mse": step_zero.mean(),
+            "random_radius": step_radius.mean(),
+            "random_direction": step_direction.mean(),
+            "step_zero_mean_mse": step_zero,
+            "step_random_radius": step_radius,
+            "step_random_direction": step_direction,
+            "random_offset_rms": offset_rms.detach().mean(),
+            "target_offset_rms": target_radius.detach().mean(),
+            "direction_active_fraction": (sigma > 0).float().mean(),
+        }

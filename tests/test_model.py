@@ -579,6 +579,39 @@ def test_spectrum_token_encoder_keeps_every_twice_pooled_peak() -> None:
     assert encoder.peak_conv_blocks[0].raw_tau.grad is not None
 
 
+def test_spectrum_token_scatter_preserves_interleaved_order_and_gradient(monkeypatch) -> None:
+    encoder = SpectrumTokenEncoder(
+        metadata_dim=3, dim=16, heads=4, peak_conv_stages=2,
+        spectrum_layers=1, dropout=0.0, peak_position_dim=8,
+        mz_bin_width=1.0, mz_upper_bound=1_000.0, peak_chunk_size=8,
+    )
+    compressed = torch.randn(9, 16, requires_grad=True)
+    owners = torch.tensor([2, 0, 2, 0, 2, 2, 0, 2, 0])
+    monkeypatch.setattr(
+        encoder, "_encode_compressed_peaks_ragged",
+        lambda *args: (compressed, owners, torch.empty(0)),
+    )
+    actual, actual_mask = encoder.forward_ragged_tokens(
+        torch.empty(0), torch.empty(0), torch.empty(0), torch.arange(3),
+        torch.empty(0), torch.empty(0), molecule_count=3,
+    )
+    expected = compressed.new_zeros(3, 5, 16)
+    expected_mask = torch.zeros(3, 5, dtype=torch.bool)
+    for molecule in range(3):
+        tokens = compressed[owners == molecule]
+        expected[molecule, :len(tokens)] = tokens
+        expected_mask[molecule, :len(tokens)] = True
+    for block in encoder.spectrum_attention_blocks:
+        expected = block(expected, expected_mask)
+    expected = encoder.output(expected).masked_fill(~expected_mask.unsqueeze(-1), 0.0)
+    torch.testing.assert_close(actual_mask, expected_mask)
+    torch.testing.assert_close(actual, expected)
+    probe = torch.randn_like(actual)
+    actual_grad = torch.autograd.grad((actual * probe).sum(), compressed, retain_graph=True)[0]
+    expected_grad = torch.autograd.grad((expected * probe).sum(), compressed)[0]
+    torch.testing.assert_close(actual_grad, expected_grad)
+
+
 def test_absolute_cloud_uses_masked_ms_tokens_and_backpropagates() -> None:
     model = AbsoluteMolecularFieldCloud(
         field_channels=1,
@@ -875,6 +908,41 @@ def test_absolute_trajectory_rollout_keeps_four_paths_for_every_step() -> None:
     assert condition.grad is not None
     assert cloud.field_encoder.input_projection.weight.grad is not None
     assert cloud.state_update.gate_bias.grad is not None
+
+
+def test_absolute_trajectory_compile_keeps_only_ms_length_dynamic() -> None:
+    cloud = AbsoluteMolecularFieldCloud(
+        field_channels=1, condition_dim=16, dim=16, heads=4,
+        condition_cross_depth=1, noise_token_count=4, noise_token_dim=8,
+        refine_depth=1, cvt_kernel_sizes=(3, 3, 3), cvt_grid_sizes=(4, 2, 1),
+        max_level=8, decoder_dim=16, gradient_checkpointing=False,
+    )
+    model = AbsoluteTrajectoryRolloutCloud(
+        cloud, intermediate_refine_depth=1, use_level_conditioning=False,
+    )
+    graphs = []
+
+    def backend(graph, example_inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = torch.compile(model, backend=backend, fullgraph=True, dynamic=True)
+    initial = torch.randn(2, 1, 8, 8)
+    levels = torch.tensor([[8, 6], [7, 5]])
+    noise = torch.randn(2, 2, 4, 4, 8)
+    for tokens in (5, 9):
+        condition = torch.randn(2, tokens, 16, requires_grad=True)
+        mask = torch.ones(2, tokens, dtype=torch.bool)
+        kwargs = {"samples": 4, "noise": noise, "condition_mask": mask,
+                  "compute_hidden_consistency": True, "hidden_consistency_samples": 1}
+        expected = model(initial, condition, levels, **kwargs)
+        actual = compiled(initial, condition, levels, **kwargs)
+        torch.testing.assert_close(actual.fields, expected.fields)
+        torch.testing.assert_close(actual.hidden_consistency_mse, expected.hidden_consistency_mse)
+        actual_grad = torch.autograd.grad(actual.fields.square().mean(), condition)[0]
+        expected_grad = torch.autograd.grad(expected.fields.square().mean(), condition)[0]
+        torch.testing.assert_close(actual_grad, expected_grad)
+    assert len(graphs) == 1
 
 
 def test_absolute_trajectory_rollout_can_reencode_every_four_steps() -> None:
