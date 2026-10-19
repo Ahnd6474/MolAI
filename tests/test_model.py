@@ -24,6 +24,7 @@ from molai.models.losses import (
     _off_diagonal_mean,
     full_band_distance,
 )
+from molai.models.parallel_smiles import ParallelFieldToSmiles, parallel_smiles_loss
 from molai.models.smiles import SmilesTokenizer
 
 
@@ -480,6 +481,59 @@ def test_field_to_smiles_probe_shapes() -> None:
     input_ids = torch.randint(0, 20, (2, 11))
     assert model(fields, input_ids).shape == (2, 11, 20)
     assert model.generate(fields, bos_token_id=1, eos_token_id=2, max_length=7).shape[0] == 2
+
+
+def test_parallel_field_to_smiles_decodes_every_random_branch() -> None:
+    model = ParallelFieldToSmiles(
+        vocab_size=20,
+        max_length=12,
+        dim=32,
+        heads=4,
+        layers=2,
+        image_grid_size=4,
+        dropout=0.0,
+    )
+    fields = torch.randn(2, 4, 1, 32, 32, requires_grad=True)
+    output = model(fields)
+
+    assert output.logits.shape == (2, 4, 12, 20)
+    assert output.length_logits.shape == (2, 4, 13)
+
+    # Token IDs follow SmilesTokenizer: BOS, molecule tokens, EOS, then PAD.
+    token_ids = torch.tensor([[1, 5, 6, 7, 2, 0], [1, 8, 9, 2, 0, 0]])
+    losses = parallel_smiles_loss(output, token_ids, pad_token_id=0)
+    losses["total"].backward()
+
+    assert torch.isfinite(losses["total"])
+    assert fields.grad is not None
+    # Every independent random image must receive its own text-supervision gradient.
+    assert fields.grad.flatten(2).norm(dim=-1).gt(0).all()
+    assert model.position_queries.grad is not None
+    assert model.field_encoder.features[0].weight.grad is not None
+
+
+def test_parallel_field_to_smiles_single_image_and_eos_masking() -> None:
+    model = ParallelFieldToSmiles(
+        vocab_size=8,
+        max_length=5,
+        dim=32,
+        heads=4,
+        layers=1,
+        image_grid_size=2,
+    )
+    fields = torch.randn(3, 1, 16, 16)
+    output = model(fields)
+    assert output.logits.shape == (3, 5, 8)
+    assert output.length_logits.shape == (3, 6)
+
+    with torch.no_grad():
+        model.token_head.weight.zero_()
+        model.token_head.bias.fill_(-1.0)
+        model.token_head.bias[2] = 1.0
+    predicted = model.predict_token_ids(fields, eos_token_id=2, pad_token_id=0)
+    assert predicted.shape == (3, 5)
+    assert predicted[:, 0].eq(2).all()
+    assert predicted[:, 1:].eq(0).all()
 
 
 def _spectrum_inputs() -> tuple[torch.Tensor, ...]:

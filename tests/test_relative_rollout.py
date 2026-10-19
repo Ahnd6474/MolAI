@@ -9,8 +9,10 @@ from molai.models.cloud import MolecularFieldCloud
 from molai.models.relative_rollout import (
     RelativeImageRolloutCloud,
     ScalarGatedRandomMemoryAttention,
+    TokenConditionRelativeCloud,
     build_relative_models,
     build_token_relative_models,
+    configure_conditional_gaussian_tokens,
 )
 
 
@@ -70,6 +72,76 @@ def test_relative_zero_path_is_deterministic_and_zero_correction_is_identity():
     torch.nn.init.zeros_(cloud.output_head.bias)
     fields = rollout(initial, condition, steps=20)
     torch.testing.assert_close(fields, initial[:, None, None].expand(1, 20, 5, 1, 8, 8))
+
+
+def test_conditional_gaussian_tokens_use_ms_query_32_image_kv_and_mean_zero_path():
+    from molai.models.attention import TokenCrossBlock2d
+
+    cloud = TokenConditionRelativeCloud(
+        condition_dim=64, dim=16, heads=4, condition_cross_depth=1,
+        noise_token_count=4, noise_token_dim=8, refine_depth=1,
+        cvt_grid_sizes=(8, 4, 2), max_resolution=32,
+        zero_mean_output=True, gradient_checkpointing=False,
+    )
+    del cloud.condition_plane
+    cloud.condition_blocks = torch.nn.ModuleList([TokenCrossBlock2d(16, 64, 4)])
+    cloud.noise_attention = ScalarGatedRandomMemoryAttention(16, 4, 8, 0.8, 0.02)
+    audit = configure_conditional_gaussian_tokens(cloud, {
+        "conditional_gaussian_tokens": True,
+        "gaussian_controller_heads": 4,
+        "gaussian_image_grid_size": 32,
+        "gaussian_sigma_min": 0.05,
+        "gaussian_sigma_max": 2.0,
+        "gaussian_sigma_init": 1.0,
+    })
+    assert audit["random_attention_kv_norm"] == "removed"
+    assert not hasattr(cloud.noise_attention, "key_norm")
+    initial = torch.randn(2, 1, 32, 32, requires_grad=True)
+    ms_tokens = torch.randn(2, 7, 64, requires_grad=True)
+    ms_mask = torch.tensor([[True] * 4 + [False] * 3, [True] * 7])
+    epsilon = torch.randn(2, 3, 4, 8)
+    epsilon[:, 0].zero_()
+    captured = {}
+
+    def capture_cross(_module, inputs):
+        captured["image_token_count"] = inputs[1].shape[1]
+
+    def capture_random(_module, inputs):
+        captured["random_tokens"] = inputs[1].detach().reshape(2, 3, 4, 8)
+
+    cross_handle = cloud.random_token_controller.cross_attention.register_forward_pre_hook(capture_cross)
+    random_handle = cloud.noise_attention.register_forward_pre_hook(capture_random)
+    image_hidden = cloud.encode_image(initial)
+    mean, sigma = cloud.random_token_controller(ms_tokens, ms_mask, image_hidden)
+    fields, _, _ = cloud(
+        initial, ms_tokens, samples=3, noise=epsilon, condition_mask=ms_mask,
+    )
+    cross_handle.remove()
+    random_handle.remove()
+
+    assert captured["image_token_count"] == 32 * 32
+    expected = mean[:, None, None] + sigma[:, None, None] * epsilon
+    torch.testing.assert_close(captured["random_tokens"], expected.detach())
+    torch.testing.assert_close(
+        captured["random_tokens"][:, 0],
+        mean[:, None].expand(-1, cloud.noise_token_count, -1).detach(),
+    )
+    assert float(sigma.detach().min()) >= 0.05 and float(sigma.detach().max()) <= 2.0
+    fields.square().mean().backward()
+    assert cloud.random_token_controller.mean_head.weight.grad.abs().sum() > 0
+    assert ms_tokens.grad is not None and ms_tokens.grad.abs().sum() > 0
+    assert initial.grad is not None and initial.grad.abs().sum() > 0
+
+    # After the first recurrent step there are multiple image paths per cached
+    # spectrum.  Their moments must remain path-specific while sharing MS.
+    cloud.cache_condition_kv = True
+    rollout = RelativeImageRolloutCloud(cloud)
+    with torch.no_grad():
+        recurrent = rollout(
+            initial.detach(), ms_tokens.detach(), steps=2, random_samples=2,
+            condition_mask=ms_mask,
+        )
+    assert recurrent.shape == (2, 2, 3, 1, 32, 32)
 
 
 def test_relative_targets_are_original_input_marginals(monkeypatch):

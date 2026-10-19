@@ -377,6 +377,8 @@ def collate_field_batch(
 def collate_spectrum_field_batch(
     batch: list[dict[str, object]],
     peak_chunk_size: int = 256,
+    tokenizer: SmilesTokenizer | None = None,
+    max_smiles_length: int | None = None,
 ) -> dict[str, Tensor | list[str]]:
     """Collate every spectrum and split every peak sequence into bounded chunks."""
 
@@ -414,7 +416,7 @@ def collate_spectrum_field_batch(
                 chunk_to_spectrum.append(spectrum_index)
             spectrum_index += 1
 
-    return {
+    output: dict[str, Tensor | list[str]] = {
         "field": torch.stack([item["field"] for item in batch]),
         "peak_chunks": torch.stack(chunks),
         "peak_mask": torch.stack(chunk_masks),
@@ -425,3 +427,17 @@ def collate_spectrum_field_batch(
         "smiles": [str(item["smiles"]) for item in batch],
         "inchikey14": [str(item["inchikey14"]) for item in batch],
     }
+    if tokenizer is not None:
+        encoded = [tokenizer.encode(str(item["smiles"])) for item in batch]
+        # max_smiles_length counts predicted tokens (molecule + EOS), not the
+        # leading BOS that is stripped by the parallel decoder loss.
+        maximum = max(len(values) - 1 for values in encoded)
+        if max_smiles_length is not None and maximum > max_smiles_length:
+            raise ValueError("batch contains a SMILES longer than max_smiles_length")
+        token_ids = torch.full(
+            (len(batch), maximum + 1), tokenizer.pad_id, dtype=torch.long
+        )
+        for index, values in enumerate(encoded):
+            token_ids[index, : len(values)] = torch.tensor(values)
+        output["token_ids"] = token_ids
+    return output

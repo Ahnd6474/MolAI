@@ -70,6 +70,41 @@ def test_strict_token_resume_restores_both_models_without_reset():
         restore_token_relative_models(checkpoint, 4)
 
 
+def test_strict_gaussian_token_resume_restores_controller_and_attention():
+    from test_navigation_training_setup import small_config
+
+    config = small_config()
+    config["model"]["condition_dim"] = 64
+    config["relative_image_rollout"] = {
+        "conditional_gaussian_tokens": True,
+        "gaussian_image_grid_size": 32,
+        "gaussian_controller_heads": 4,
+        "gaussian_sigma_min": 0.05,
+        "gaussian_sigma_max": 2.0,
+        "gaussian_sigma_init": 1.0,
+    }
+    cloud, encoder, _ = build_fresh_token_relative_models(
+        config, 3, gradient_checkpointing=False,
+    )
+    with torch.no_grad():
+        for parameter in (*cloud.parameters(), *encoder.parameters()):
+            parameter.add_(0.071)
+    checkpoint = {
+        "config": config,
+        "cloud": cloud.state_dict(),
+        "condition_encoder": encoder.state_dict(),
+    }
+    restored, ms, audit = restore_token_relative_models(
+        checkpoint, 3, gradient_checkpointing=False,
+    )
+    assert audit["all_loaded_tensors_identical"]
+    assert restored.random_token_controller.image_grid_size == 32
+    assert not hasattr(restored.noise_attention, "key_norm")
+    for actual, expected in ((restored, cloud), (ms, encoder)):
+        for key, value in expected.state_dict().items():
+            assert torch.equal(actual.state_dict()[key], value)
+
+
 def test_million_config_preserves_objective_and_exact_budget():
     root = Path(__file__).resolve().parents[1]
     original = yaml.safe_load((root / "configs/navigation_ustat.yaml").read_text(encoding="utf-8"))

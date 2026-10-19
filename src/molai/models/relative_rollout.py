@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -61,6 +63,148 @@ class ScalarGatedRandomMemoryAttention(nn.Module):
         return query + self.gate * update
 
 
+class UnnormalizedGaussianRandomMemoryAttention(nn.Module):
+    """Attend to conditionally sampled Gaussian tokens without erasing moments.
+
+    The Gaussian controller owns the token mean and standard deviation.  K/V
+    normalization here would make a scalar change in standard deviation nearly
+    invisible, so only the image query keeps the historical pre-normalization.
+    Parameter names intentionally match ``ScalarGatedRandomMemoryAttention`` so
+    its learned projections and scalar residual gate can be transferred exactly.
+    """
+
+    def __init__(self, dim: int, heads: int, random_dim: int, temperature: float, gate_init: float):
+        super().__init__()
+        if dim % heads or temperature <= 0:
+            raise ValueError("dim must be divisible by heads and temperature positive")
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.random_dim = random_dim
+        self.temperature = temperature
+        self.query_norm = nn.LayerNorm(dim)
+        self.query_projection = nn.Linear(dim, dim, bias=False)
+        self.key_projection = nn.Linear(random_dim, dim, bias=False)
+        self.value_projection = nn.Linear(random_dim, dim, bias=False)
+        self.output_projection = nn.Linear(dim, dim, bias=False)
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def forward(self, query: Tensor, random_tokens: Tensor, spatial_amplitude: Tensor) -> Tensor:
+        batch, height, width, dim = query.shape
+        if dim != self.dim or random_tokens.shape[0] != batch or random_tokens.shape[-1] != self.random_dim:
+            raise ValueError("query/random memory dimensions do not match")
+        if spatial_amplitude.shape != (batch, height, width):
+            raise ValueError("spatial_amplitude must have shape [B,H,W]")
+        projected_query = self.query_projection(self.query_norm(query)).reshape(
+            batch, height * width, self.heads, self.head_dim
+        )
+        key = self.key_projection(random_tokens).reshape(
+            batch, random_tokens.shape[1], self.heads, self.head_dim
+        )
+        value = self.value_projection(random_tokens).reshape(
+            batch, random_tokens.shape[1], self.heads, self.head_dim
+        )
+        attended = F.scaled_dot_product_attention(
+            projected_query.permute(0, 2, 1, 3) / self.temperature,
+            key.permute(0, 2, 1, 3), value.permute(0, 2, 1, 3),
+            dropout_p=0.0, is_causal=False,
+        )
+        attended = attended.permute(0, 2, 1, 3).reshape(batch, height, width, dim)
+        update = self.output_projection(attended) * spatial_amplitude[..., None]
+        return query + self.gate * update
+
+
+class ConditionalGaussianTokenController(nn.Module):
+    """Infer one diagonal Gaussian from MS-Q / 32x32 image-K,V alignment."""
+
+    def __init__(
+        self,
+        image_dim: int,
+        ms_dim: int,
+        token_dim: int,
+        heads: int,
+        *,
+        image_grid_size: int = 32,
+        ffn_ratio: float = 2.0,
+        cross_gate_init: float = 0.1,
+        sigma_min: float = 0.05,
+        sigma_max: float = 2.0,
+        sigma_init: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if image_dim % heads:
+            raise ValueError("image/controller dimension must be divisible by heads")
+        if image_grid_size < 1:
+            raise ValueError("image_grid_size must be positive")
+        if not 0 <= sigma_min < sigma_init < sigma_max:
+            raise ValueError("require 0 <= sigma_min < sigma_init < sigma_max")
+        self.image_grid_size = image_grid_size
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.ms_projection = nn.Linear(ms_dim, image_dim)
+        self.ms_norm = nn.LayerNorm(image_dim)
+        self.image_norm = nn.LayerNorm(image_dim)
+        self.cross_attention = nn.MultiheadAttention(image_dim, heads, batch_first=True)
+        self.cross_gate = nn.Parameter(torch.tensor(float(cross_gate_init)))
+        hidden = max(image_dim, round(image_dim * ffn_ratio))
+        self.ffn_norm = nn.LayerNorm(image_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(image_dim, hidden), nn.GELU(), nn.Linear(hidden, image_dim),
+        )
+        self.pool_query = nn.Parameter(torch.randn(1, 1, image_dim) * 0.02)
+        self.pool_norm = nn.LayerNorm(image_dim)
+        self.pool_attention = nn.MultiheadAttention(image_dim, heads, batch_first=True)
+        self.output_norm = nn.LayerNorm(image_dim)
+        self.mean_head = nn.Linear(image_dim, token_dim)
+        self.scale_head = nn.Linear(image_dim, token_dim)
+        nn.init.normal_(self.mean_head.weight, std=1e-3)
+        nn.init.zeros_(self.mean_head.bias)
+        nn.init.zeros_(self.scale_head.weight)
+        fraction = (sigma_init - sigma_min) / (sigma_max - sigma_min)
+        nn.init.constant_(self.scale_head.bias, math.log(fraction / (1.0 - fraction)))
+
+    def forward(
+        self, ms_tokens: Tensor, ms_mask: Tensor, image_hidden: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if ms_tokens.ndim != 3 or ms_mask.shape != ms_tokens.shape[:2]:
+            raise ValueError("MS tokens and mask must have shapes [B,L,D] and [B,L]")
+        if image_hidden.ndim != 4 or image_hidden.shape[0] % ms_tokens.shape[0]:
+            raise ValueError("image paths must be grouped by their MS owner")
+        paths_per_spectrum = image_hidden.shape[0] // ms_tokens.shape[0]
+        if paths_per_spectrum > 1:
+            # A cached MS bank is shared by all recurrent image paths.  The
+            # controller still predicts path-specific moments because its K/V
+            # image differs after the first rollout step.
+            ms_tokens = ms_tokens.repeat_interleave(paths_per_spectrum, dim=0)
+            ms_mask = ms_mask.repeat_interleave(paths_per_spectrum, dim=0)
+        # Production images are 128x128.  The min keeps small unit-test models
+        # meaningful without silently upsampling their spatial representation.
+        side = min(self.image_grid_size, image_hidden.shape[1], image_hidden.shape[2])
+        image = F.adaptive_avg_pool2d(
+            image_hidden.permute(0, 3, 1, 2), (side, side)
+        ).flatten(2).transpose(1, 2)
+        ms = self.ms_projection(ms_tokens)
+        normalized_image = self.image_norm(image)
+        update, _ = self.cross_attention(
+            self.ms_norm(ms), normalized_image, normalized_image,
+            need_weights=False,
+        )
+        aligned = (ms + self.cross_gate * update).masked_fill(~ms_mask[..., None], 0.0)
+        aligned = (aligned + self.ffn(self.ffn_norm(aligned))).masked_fill(
+            ~ms_mask[..., None], 0.0
+        )
+        query = self.pool_query.expand(len(ms_tokens), -1, -1)
+        pooled, _ = self.pool_attention(
+            query, self.pool_norm(aligned), self.pool_norm(aligned),
+            key_padding_mask=~ms_mask.bool(), need_weights=False,
+        )
+        pooled = self.output_norm(pooled[:, 0])
+        mean = self.mean_head(pooled)
+        fraction = torch.sigmoid(self.scale_head(pooled).float())
+        sigma = self.sigma_min + (self.sigma_max - self.sigma_min) * fraction
+        return mean, sigma.to(mean.dtype)
+
+
 def build_relative_models(
     checkpoint: dict, metadata_dim: int, *, gradient_checkpointing: bool = False,
     cloud_class: type[MolecularFieldCloud] = MolecularFieldCloud,
@@ -97,6 +241,10 @@ class TokenConditionRelativeCloud(MolecularFieldCloud):
     packed_condition_kv = False
     uncheckpointed_refine_blocks = 0
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.random_token_controller: ConditionalGaussianTokenController | None = None
+
     def _run(self, module, *args):
         skip = self.uncheckpointed_refine_blocks
         if skip and any(module is block for block in self.refine_blocks[-skip:]):
@@ -113,13 +261,16 @@ class TokenConditionRelativeCloud(MolecularFieldCloud):
                          for key, value in projected)
         return projected
 
-    def encode_condition(self, current: Tensor, condition) -> Tensor:
-        tokens, mask, prepared = condition
+    def encode_image(self, current: Tensor) -> Tensor:
+        if current.ndim != 4 or current.shape[1] != self.field_channels:
+            raise ValueError("current must have shape [B,C,H,W]")
         hidden = self.field_encoder(current)
         height, width = current.shape[-2:]
-        hidden = hidden + sinusoidal_2d_position(
+        return hidden + sinusoidal_2d_position(
             height, width, self.dim, hidden.device, hidden.dtype,
         )[None]
+
+    def apply_condition(self, hidden: Tensor, tokens: Tensor, mask: Tensor, prepared) -> Tensor:
         for index, block in enumerate(self.condition_blocks):
             if prepared is None:
                 hidden = self._run(block, hidden, tokens, mask)
@@ -132,9 +283,105 @@ class TokenConditionRelativeCloud(MolecularFieldCloud):
                     hidden = self._run(block.forward_projected, hidden, key, value, mask)
         return hidden
 
+    def encode_condition(self, current: Tensor, condition) -> Tensor:
+        tokens, mask, prepared = condition
+        return self.apply_condition(self.encode_image(current), tokens, mask, prepared)
+
     def forward(self, current, condition, samples=4, noise=None, condition_mask=None,
                 prepared_condition=None):
-        return super().forward(current, (condition, condition_mask, prepared_condition), samples, noise)
+        if self.random_token_controller is None:
+            return super().forward(
+                current, (condition, condition_mask, prepared_condition), samples, noise,
+            )
+        if condition_mask is None or condition_mask.shape != condition.shape[:2]:
+            raise ValueError("conditional Gaussian tokens require a matching MS mask")
+        image_hidden = self.encode_image(current)
+        encoded = self.apply_condition(image_hidden, condition, condition_mask, prepared_condition)
+        energy = self.spatial_noise_energy(encoded)
+        epsilon = self._prepare_noise(encoded, samples, noise)
+        mean, sigma = self._run(
+            self.random_token_controller, condition, condition_mask, image_hidden,
+        )
+        gaussian_tokens = mean[:, None, None, :] + sigma[:, None, None, :] * epsilon
+
+        batch, height, width, _ = encoded.shape
+        tokens = encoded[:, None].expand(-1, samples, -1, -1, -1)
+        tokens = tokens.reshape(batch * samples, height, width, self.dim)
+        random_context = gaussian_tokens.reshape(
+            batch * samples, self.noise_token_count, self.noise_token_dim
+        )
+        spatial_amplitude = (energy / self.dim).sqrt()
+        spatial_amplitude = spatial_amplitude[:, None].expand(-1, samples, -1, -1)
+        spatial_amplitude = spatial_amplitude.reshape(batch * samples, height, width)
+        tokens = self._run(self.noise_attention, tokens, random_context, spatial_amplitude)
+        for block in self.refine_blocks:
+            tokens = self._run(block, tokens)
+
+        residual = self.output_head(self.output_norm(tokens)).permute(0, 3, 1, 2)
+        expanded_current = current[:, None].expand(-1, samples, -1, -1, -1)
+        fields = expanded_current.reshape(batch * samples, *current.shape[1:]) + residual
+        if self.zero_mean_output:
+            fields = fields - fields.float().mean(dim=(-2, -1), keepdim=True).to(fields.dtype)
+        molecular_embeddings = self.readout(tokens.mean(dim=(1, 2)))
+        return (
+            fields.reshape(batch, samples, *current.shape[1:]),
+            energy,
+            molecular_embeddings.reshape(batch, samples, -1),
+        )
+
+
+def configure_conditional_gaussian_tokens(
+    cloud: TokenConditionRelativeCloud, options: dict,
+) -> dict:
+    """Install or validate the opt-in MS/image-conditioned Gaussian memory."""
+    enabled = bool(options.get("conditional_gaussian_tokens", False))
+    if not enabled:
+        if cloud.random_token_controller is not None:
+            raise ValueError("a Gaussian-token checkpoint cannot disable its controller")
+        return {"conditional_gaussian_tokens": False}
+    if cloud.random_token_controller is not None:
+        return {
+            "conditional_gaussian_tokens": True,
+            "gaussian_controller": "restored",
+            "gaussian_image_grid_size": cloud.random_token_controller.image_grid_size,
+        }
+    old_attention = cloud.noise_attention
+    if not isinstance(old_attention, ScalarGatedRandomMemoryAttention):
+        raise TypeError(
+            "conditional Gaussian conversion requires the historical scalar-gated random attention"
+        )
+    attention = UnnormalizedGaussianRandomMemoryAttention(
+        cloud.dim,
+        old_attention.heads,
+        cloud.noise_token_dim,
+        old_attention.temperature,
+        float(old_attention.gate.detach()),
+    )
+    # LayerNorm without affine parameters contributed no checkpoint tensors, so
+    # every learned projection and the historical scalar gate transfer strictly.
+    attention.load_state_dict(old_attention.state_dict(), strict=True)
+    cloud.noise_attention = attention
+    cloud.random_token_controller = ConditionalGaussianTokenController(
+        image_dim=cloud.dim,
+        ms_dim=int(options.get("gaussian_ms_dim", 64)),
+        token_dim=cloud.noise_token_dim,
+        heads=int(options.get("gaussian_controller_heads", old_attention.heads)),
+        image_grid_size=int(options.get("gaussian_image_grid_size", 32)),
+        ffn_ratio=float(options.get("gaussian_controller_ffn_ratio", 2.0)),
+        cross_gate_init=float(options.get("gaussian_cross_gate_init", 0.1)),
+        sigma_min=float(options.get("gaussian_sigma_min", 0.05)),
+        sigma_max=float(options.get("gaussian_sigma_max", 2.0)),
+        sigma_init=float(options.get("gaussian_sigma_init", 1.0)),
+    )
+    return {
+        "conditional_gaussian_tokens": True,
+        "gaussian_controller": "new-ms-query-image-kv-attention-pool",
+        "gaussian_image_grid_size": cloud.random_token_controller.image_grid_size,
+        "gaussian_zero": "epsilon-zero-all-64-tokens-equal-predicted-mean",
+        "gaussian_random": "predicted-mean-plus-sigma-times-standard-normal",
+        "random_attention_kv_norm": "removed",
+        "transferred_random_attention_tensors": len(attention.state_dict()),
+    }
 
 
 def build_token_relative_models(checkpoint: dict, metadata_dim: int, *, gradient_checkpointing=True):
@@ -192,6 +439,9 @@ def build_fresh_token_relative_models(config: dict, metadata_dim: int, *, gradie
                           float(options["ffn_ratio"]), float(options["condition_gate_init"]))
         for _ in range(int(options["condition_cross_depth"]))
     ])
+    gaussian_audit = configure_conditional_gaussian_tokens(
+        cloud, config.get("relative_image_rollout", {}),
+    )
     cloud.readout.requires_grad_(False)
     spectrum = dict(config["spectrum_encoder"])
     spectrum.update(heads=4, peak_conv_stages=2, spectrum_layers=2)
@@ -199,9 +449,13 @@ def build_fresh_token_relative_models(config: dict, metadata_dim: int, *, gradie
         metadata_dim=metadata_dim, dim=64,
         peak_chunk_size=int(config["training"].get("peak_chunk_size", 256)), **spectrum,
     )
-    return cloud, encoder, {"mode": "scratch-64d-ms-tokens-ordinary-cross-attention",
-                            "initialization": "random", "loaded_parameter_tensors": 0,
-                            "random_attention": "historical-scalar-gate"}
+    return cloud, encoder, {
+        "mode": "scratch-64d-ms-tokens-ordinary-cross-attention",
+        "initialization": "random", "loaded_parameter_tensors": 0,
+        "random_attention": "conditional-gaussian" if gaussian_audit["conditional_gaussian_tokens"]
+        else "historical-scalar-gate",
+        **gaussian_audit,
+    }
 
 
 def build_ms_reset_relative_models(checkpoint: dict, config: dict, metadata_dim: int,
@@ -270,7 +524,8 @@ def configure_relative_execution(cloud, options):
 
     if bool(options.get("compile_blocks", False)):
         cloud.field_encoder.forward = compile_call(cloud.field_encoder.forward)
-        for module in (*cloud.condition_blocks, cloud.noise_attention, *cloud.refine_blocks):
+        optional = (() if cloud.random_token_controller is None else (cloud.random_token_controller,))
+        for module in (*cloud.condition_blocks, *optional, cloud.noise_attention, *cloud.refine_blocks):
             module.forward = compile_call(module.forward)
         if cloud.cache_condition_kv:
             for module in cloud.condition_blocks:

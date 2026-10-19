@@ -1,0 +1,80 @@
+# Warm-start a token-conditioned relative Cloud with an MS/image-conditioned
+# Gaussian random-memory distribution.  This is a new architecture/optimizer
+# phase: use --checkpoint, not --resume, with an existing non-Gaussian run.
+token_conditioning: true
+conditional_gaussian_tokens: true
+gaussian_ms_dim: 64
+gaussian_controller_heads: 4
+gaussian_image_grid_size: 32
+gaussian_controller_ffn_ratio: 2.0
+gaussian_cross_gate_init: 0.1
+gaussian_sigma_min: 0.05
+gaussian_sigma_max: 2.0
+gaussian_sigma_init: 1.0
+
+alignment_steps: 0
+max_postpool_peak_tokens: 8192
+length_bucket_batches: 16
+refine_depth: 3
+steps: 1
+validation_steps: 1
+validation_start_levels: uniform
+long_rollout_steps: 23
+long_rollout_samples: 4
+condition_control_every_epochs: 5
+condition_control_batches: 2
+random_samples: 4
+
+# Every Random field is independently translated to canonical SMILES.  The
+# decoder receives learned output-position queries only (no teacher-forced
+# tokens): image cross-attention -> bidirectional self-attention -> FFN.
+parallel_smiles: true
+smiles_max_length: 192
+smiles_dim: 256
+smiles_heads: 8
+smiles_layers: 4
+smiles_image_grid_size: 16
+smiles_ffn_ratio: 4.0
+smiles_dropout: 0.1
+smiles_loss_weight: 0.05
+smiles_length_loss_weight: 0.1
+smiles_learning_rate: 0.0001
+
+batch_size_per_gpu: 16
+validation_batch_size_per_gpu: 4
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+compile_rollout: false
+# Compiled CvT blocks currently conflict with activation-checkpoint recomputation
+# once the downstream parallel text head consumes the rollout graph.
+compile_blocks: false
+compile_loss: true
+preserve_bf16_rounding: true
+cache_ms_kv: true
+packed_ms_kv: true
+uncheckpointed_refine_blocks: 2
+
+epochs: 119
+max_steps: 1000000
+lr_schedule_start_step: 0
+warmup_start_learning_rate: 0.00001
+learning_rate: 0.00003
+min_learning_rate: 0.00001
+warmup_steps: 1000
+weight_decay: 0.0001
+
+loss_name: navigation_ustat
+loss_mode: vp_transition_geometry
+u_statistic_weight: 1.0
+zero_mean_mse_weight: 1.0
+random_radius_weight: 1.0
+random_direction_weight: 1.0
+radius_use_token_rms: true
+log_every: 10
+
+transition_jumps:
+  - {max_level: 8, jump: 1}
+  - {max_level: 16, jump: 2}
+  - {max_level: 32, jump: 4}
+  - {max_level: 56, jump: 8}
+  - {max_level: 64, jump: 2}

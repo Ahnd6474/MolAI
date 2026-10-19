@@ -40,15 +40,22 @@ from molai.data import ShardShuffleSampler, SpectrumFieldDataset, collate_spectr
 from molai.models.bridge import CosineVPSchedule
 from molai.models.condition import bind_spectrum_metadata
 from molai.models.losses import FullBandEnergyDistance, vp_cloud_geometry_losses
+from molai.models.parallel_smiles import (
+    ParallelFieldToSmiles,
+    ParallelSmilesOutput,
+    parallel_smiles_loss,
+)
 from molai.models.relative_rollout import (
     RelativeImageRolloutCloud,
     build_fresh_token_relative_models,
     build_ms_reset_relative_models,
     build_relative_models,
     build_token_relative_models,
+    configure_conditional_gaussian_tokens,
     configure_relative_execution,
     restore_token_relative_models,
 )
+from molai.models.smiles import SmilesTokenizer
 
 
 def condition_arguments(condition):
@@ -102,8 +109,72 @@ def make_lr_scheduler(optimizer, options, updates, *, global_step=0):
 
     # load_state_dict preserves moments and parameter order. Only LR is changed.
     for group in optimizer.param_groups:
-        group["initial_lr"] = peak
+        group["initial_lr"] = float(group.get("schedule_peak_lr", peak))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor, last_epoch=global_step - 1)
+
+
+def add_parallel_smiles_supervision(
+    losses: dict[str, Tensor],
+    text_model,
+    random_fields: Tensor,
+    token_ids: Tensor,
+    options: dict,
+) -> tuple[dict[str, Tensor], ParallelSmilesOutput]:
+    """Decode every Random branch independently and add its token objective."""
+
+    output = text_model(random_fields)
+    text = parallel_smiles_loss(
+        output,
+        token_ids,
+        pad_token_id=int(options["smiles_pad_token_id"]),
+        length_weight=float(options.get("smiles_length_loss_weight", 0.1)),
+    )
+    image_total = losses["total"]
+    combined = dict(losses)
+    combined.update(
+        image_total=image_total,
+        smiles_total=text["total"],
+        smiles_token_cross_entropy=text["token_cross_entropy"],
+        smiles_length_cross_entropy=text["length_cross_entropy"],
+        total=image_total + float(options["smiles_loss_weight"]) * text["total"],
+    )
+    return combined, output
+
+
+@torch.no_grad()
+def parallel_smiles_metrics(
+    output: ParallelSmilesOutput,
+    token_ids: Tensor,
+    pad_token_id: int,
+) -> dict[str, Tensor]:
+    """Token, per-branch exact, best-branch exact and length accuracy."""
+
+    targets = token_ids[:, 1:]
+    slots = output.logits.shape[-2]
+    padded = token_ids.new_full((len(token_ids), slots), pad_token_id)
+    padded[:, : targets.shape[1]] = targets
+    if output.logits.ndim == 4:
+        padded = padded[:, None].expand(-1, output.logits.shape[1], -1)
+    predicted = output.logits.argmax(dim=-1)
+    valid = padded.ne(pad_token_id)
+    correct = predicted.eq(padded)
+    token_accuracy = (correct & valid).sum() / valid.sum().clamp_min(1)
+    exact = (correct | ~valid).all(dim=-1).float()
+    if exact.ndim == 2:
+        branch_exact = exact.mean()
+        best_exact = exact.amax(dim=1).mean()
+    else:
+        branch_exact = best_exact = exact.mean()
+    lengths = targets.ne(pad_token_id).sum(dim=-1).clamp_max(slots)
+    if output.length_logits.ndim == 3:
+        lengths = lengths[:, None].expand(-1, output.length_logits.shape[1])
+    length_accuracy = output.length_logits.argmax(dim=-1).eq(lengths).float().mean()
+    return {
+        "smiles_token_accuracy": token_accuracy,
+        "smiles_exact_match": branch_exact,
+        "smiles_best_of_4_exact_match": best_exact,
+        "smiles_length_accuracy": length_accuracy,
+    }
 
 
 @torch.no_grad()
@@ -401,7 +472,9 @@ def save_long_rollout_preview(preview, output, epoch, paths=5):
 
 
 @torch.no_grad()
-def condition_control_metrics(rollout, condition_runner, loader, schedule, options, device):
+def condition_control_metrics(
+    rollout, condition_runner, loader, schedule, options, device, text_model=None,
+):
     """Small fixed-seed long-rollout diagnostic: true vs within-batch shuffled MS.
 
     Both conditions receive exactly the same initial image and random tokens.
@@ -409,9 +482,21 @@ def condition_control_metrics(rollout, condition_runner, loader, schedule, optio
     """
     rollout.eval()
     condition_runner.eval()
-    totals = dict.fromkeys(("true_random_correlation", "shuffled_random_correlation",
-                           "true_random_mse", "shuffled_random_mse",
-                           "true_zero_correlation", "shuffled_zero_correlation"), 0.)
+    if text_model is not None:
+        text_model.eval()
+    keys = ["true_random_correlation", "shuffled_random_correlation",
+            "true_random_delta_correlation", "shuffled_random_delta_correlation",
+            "true_random_residual_correlation", "shuffled_random_residual_correlation",
+            "true_random_mse", "shuffled_random_mse",
+            "true_zero_correlation", "shuffled_zero_correlation",
+            "true_zero_delta_correlation", "shuffled_zero_delta_correlation",
+            "true_zero_residual_correlation", "shuffled_zero_residual_correlation"]
+    if text_model is not None:
+        keys.extend(("true_smiles_token_cross_entropy", "shuffled_smiles_token_cross_entropy",
+                     "true_smiles_token_accuracy", "shuffled_smiles_token_accuracy",
+                     "true_smiles_exact_match", "shuffled_smiles_exact_match",
+                     "true_smiles_best_of_4_exact_match", "shuffled_smiles_best_of_4_exact_match"))
+    totals = dict.fromkeys(keys, 0.)
     count = 0
     devices = [device.index or 0] if device.type == "cuda" else []
     with torch.random.fork_rng(devices=devices):
@@ -439,27 +524,116 @@ def condition_control_metrics(rollout, condition_runner, loader, schedule, optio
                     truth = truth - truth.mean(dim=1, keepdim=True)
                     correlation = (centered * truth[:, None]).sum(dim=2) / (
                         centered.norm(dim=2) * truth.norm(dim=1)[:, None]).clamp_min(1e-12)
+                    # The absolute final image still contains the common initial
+                    # state.  Compare only the cumulative model correction with
+                    # the correction required to reach the clean target.
+                    delta = final.float() - initial.float()[:, None]
+                    target_delta = clean.float() - initial.float()
+                    centered_delta = delta.flatten(2) - delta.flatten(2).mean(dim=2, keepdim=True)
+                    centered_target_delta = target_delta.flatten(1)
+                    centered_target_delta = (
+                        centered_target_delta - centered_target_delta.mean(dim=1, keepdim=True)
+                    )
+                    delta_correlation = (centered_delta * centered_target_delta[:, None]).sum(dim=2) / (
+                        centered_delta.norm(dim=2) * centered_target_delta.norm(dim=1)[:, None]
+                    ).clamp_min(1e-12)
+                    residual_correlation = (centered_delta * truth[:, None]).sum(dim=2) / (
+                        centered_delta.norm(dim=2) * truth.norm(dim=1)[:, None]
+                    ).clamp_min(1e-12)
                     totals[f"{name}_random_correlation"] += float(correlation[:, 1:].mean()) * len(clean)
                     totals[f"{name}_zero_correlation"] += float(correlation[:, 0].mean()) * len(clean)
+                    totals[f"{name}_random_delta_correlation"] += (
+                        float(delta_correlation[:, 1:].mean()) * len(clean)
+                    )
+                    totals[f"{name}_zero_delta_correlation"] += (
+                        float(delta_correlation[:, 0].mean()) * len(clean)
+                    )
+                    totals[f"{name}_random_residual_correlation"] += (
+                        float(residual_correlation[:, 1:].mean()) * len(clean)
+                    )
+                    totals[f"{name}_zero_residual_correlation"] += (
+                        float(residual_correlation[:, 0].mean()) * len(clean)
+                    )
                     totals[f"{name}_random_mse"] += float((final[:, 1:] - clean[:, None]).square().mean()) * len(clean)
-                    del final, centered, correlation
+                    if text_model is not None:
+                        token_ids = batch["token_ids"].to(device, non_blocking=True)
+                        text_output = text_model(final[:, 1:])
+                        text_loss = parallel_smiles_loss(
+                            text_output, token_ids,
+                            pad_token_id=int(options["smiles_pad_token_id"]),
+                            length_weight=float(options.get("smiles_length_loss_weight", 0.1)),
+                        )
+                        text_metrics = parallel_smiles_metrics(
+                            text_output, token_ids, int(options["smiles_pad_token_id"]),
+                        )
+                        totals[f"{name}_smiles_token_cross_entropy"] += (
+                            float(text_loss["token_cross_entropy"]) * len(clean)
+                        )
+                        for key in ("smiles_token_accuracy", "smiles_exact_match",
+                                    "smiles_best_of_4_exact_match"):
+                            totals[f"{name}_{key}"] += float(text_metrics[key]) * len(clean)
+                    del final, centered, correlation, delta, target_delta
+                    del centered_delta, centered_target_delta, delta_correlation, residual_correlation
             count += len(clean)
     result = {key: _distributed_mean(value, count, device) for key, value in totals.items()}
     result["random_correlation_gain"] = result["true_random_correlation"] - result["shuffled_random_correlation"]
+    result["random_delta_correlation_gain"] = (
+        result["true_random_delta_correlation"] -
+        result["shuffled_random_delta_correlation"]
+    )
+    result["random_residual_correlation_gain"] = (
+        result["true_random_residual_correlation"] -
+        result["shuffled_random_residual_correlation"]
+    )
     result["random_mse_reduction"] = result["shuffled_random_mse"] - result["true_random_mse"]
+    if text_model is not None:
+        result["smiles_cross_entropy_gain"] = (
+            result["shuffled_smiles_token_cross_entropy"] -
+            result["true_smiles_token_cross_entropy"]
+        )
+        result["smiles_token_accuracy_gain"] = (
+            result["true_smiles_token_accuracy"] - result["shuffled_smiles_token_accuracy"]
+        )
     world = dist.get_world_size() if dist.is_initialized() else 1
     result["molecules"] = count * world
     return result
 
 
 @torch.no_grad()
-def validate(rollout, condition_runner, loader, schedule, distance, config, options, device, max_batches=None):
+def validate(
+    rollout, condition_runner, loader, schedule, distance, config, options, device,
+    max_batches=None, text_model=None,
+):
     rollout.eval()
     condition_runner.eval()
-    totals = dict.fromkeys((*loss_metric_keys(options), "diversity", "target_diversity"), 0.0)
+    if text_model is not None:
+        text_model.eval()
+    metric_keys = [*loss_metric_keys(options), "diversity", "target_diversity"]
+    corrected_distance = None
+    if options.get("loss_mode") == "vp_transition_geometry":
+        # Training omits the target-target term because it is constant with
+        # respect to the model.  Report the complete energy distance as well so
+        # the irreducible target-cloud floor is not mistaken for model error.
+        corrected_distance = FullBandEnergyDistance(
+            levels=distance.levels,
+            include_target_constant=True,
+            unbiased=distance.unbiased,
+        )
+        metric_keys.extend(("u_statistic_corrected", "u_statistic_target_floor"))
+    if text_model is not None:
+        metric_keys.extend(("image_total", "smiles_total", "smiles_token_cross_entropy",
+                            "smiles_length_cross_entropy", "smiles_token_accuracy",
+                            "smiles_exact_match", "smiles_best_of_4_exact_match",
+                            "smiles_length_accuracy"))
+    totals = dict.fromkeys(metric_keys, 0.0)
     final_totals = dict.fromkeys(("zero_mse", "random_mse", "best_of_4_mse", "zero_correlation",
                                  "random_correlation", "best_of_4_correlation", "random_diversity",
-                                 "zero_rms", "random_rms", "clean_rms"), 0.0)
+                                 "zero_rms", "random_rms", "clean_rms",
+                                 "zero_update_clean_correlation", "random_update_clean_correlation",
+                                 "best_of_4_update_clean_correlation",
+                                 "zero_update_target_correlation", "random_update_target_correlation",
+                                 "best_of_4_update_target_correlation", "zero_update_rms",
+                                 "random_update_rms"), 0.0)
     step_keys = (("zero_current_mean_mse", "u_statistic")
                  if options.get("loss_mode") == "zero_current_global_vp_ustat" else
                  (("zero_mean_mse", "random_radius", "random_direction")
@@ -499,6 +673,29 @@ def validate(rollout, condition_runner, loader, schedule, distance, config, opti
                     )
                 losses = configured_rollout_losses(fields, targets, initial, clean, distance,
                                                     options, target_mean, posterior_noise_rms, noise)
+                if corrected_distance is not None:
+                    innovations = (
+                        fields[:, :, 1:].float()
+                        - target_mean[:, :, 1:].detach().float()
+                    )
+                    origin = torch.zeros_like(initial, dtype=torch.float32)
+                    corrected_steps = torch.stack([
+                        corrected_distance(
+                            innovations[:, step], targets[:, step].detach(), origin,
+                        )
+                        for step in range(fields.shape[1])
+                    ])
+                    corrected = corrected_steps.mean()
+                    losses["u_statistic_corrected"] = corrected
+                    losses["u_statistic_target_floor"] = losses["u_statistic"] - corrected
+                if text_model is not None:
+                    token_ids = batch["token_ids"].to(device, non_blocking=True)
+                    losses, text_output = add_parallel_smiles_supervision(
+                        losses, text_model, fields[:, -1, 1:], token_ids, options,
+                    )
+                    losses.update(parallel_smiles_metrics(
+                        text_output, token_ids, int(options["smiles_pad_token_id"]),
+                    ))
             for key in totals:
                 totals[key] += float(losses[key]) * len(clean)
             final = fields[:, -1].float()
@@ -507,6 +704,19 @@ def validate(rollout, condition_runner, loader, schedule, distance, config, opti
             truth = clean.flatten(1) - clean.flatten(1).mean(dim=1, keepdim=True)
             correlation = (centered * truth[:, None]).sum(dim=2) / (
                 centered.norm(dim=2) * truth.norm(dim=1)[:, None]).clamp_min(1e-12)
+            update = final - initial.float()[:, None]
+            centered_update = update.flatten(2) - update.flatten(2).mean(dim=2, keepdim=True)
+            target_update = clean.float() - initial.float()
+            centered_target_update = target_update.flatten(1)
+            centered_target_update = (
+                centered_target_update - centered_target_update.mean(dim=1, keepdim=True)
+            )
+            update_clean_correlation = (centered_update * truth[:, None]).sum(dim=2) / (
+                centered_update.norm(dim=2) * truth.norm(dim=1)[:, None]
+            ).clamp_min(1e-12)
+            update_target_correlation = (centered_update * centered_target_update[:, None]).sum(dim=2) / (
+                centered_update.norm(dim=2) * centered_target_update.norm(dim=1)[:, None]
+            ).clamp_min(1e-12)
             final_metrics = {"zero_mse": errors[:, 0].mean(), "random_mse": errors[:, 1:].mean(),
                 "best_of_4_mse": errors[:, 1:].min(dim=1).values.mean(),
                 "zero_correlation": correlation[:, 0].mean(), "random_correlation": correlation[:, 1:].mean(),
@@ -514,7 +724,15 @@ def validate(rollout, condition_runner, loader, schedule, distance, config, opti
                 "random_diversity": final[:, 1:].var(dim=1, unbiased=False).mean(),
                 "zero_rms": final[:, 0].square().mean().sqrt(),
                 "random_rms": final[:, 1:].square().mean().sqrt(),
-                "clean_rms": clean.square().mean().sqrt()}
+                "clean_rms": clean.square().mean().sqrt(),
+                "zero_update_clean_correlation": update_clean_correlation[:, 0].mean(),
+                "random_update_clean_correlation": update_clean_correlation[:, 1:].mean(),
+                "best_of_4_update_clean_correlation": update_clean_correlation[:, 1:].max(dim=1).values.mean(),
+                "zero_update_target_correlation": update_target_correlation[:, 0].mean(),
+                "random_update_target_correlation": update_target_correlation[:, 1:].mean(),
+                "best_of_4_update_target_correlation": update_target_correlation[:, 1:].max(dim=1).values.mean(),
+                "zero_update_rms": update[:, 0].square().mean().sqrt(),
+                "random_update_rms": update[:, 1:].square().mean().sqrt()}
             for key, value in final_metrics.items():
                 final_totals[key] += float(value) * len(clean)
             for key in step_keys:
@@ -613,6 +831,17 @@ def main() -> None:
         for key in keys:
             if key not in options or not math.isfinite(float(options[key])) or float(options[key]) < 0:
                 raise ValueError(f"{key} must be a finite, non-negative loss weight")
+    text_enabled = bool(options.get("parallel_smiles", False))
+    if text_enabled:
+        for key in ("smiles_max_length", "smiles_dim", "smiles_heads", "smiles_layers",
+                    "smiles_image_grid_size"):
+            if int(options.get(key, 0)) < 1:
+                raise ValueError(f"{key} must be positive when parallel_smiles is enabled")
+        for key in ("smiles_loss_weight", "smiles_length_loss_weight", "smiles_learning_rate"):
+            if not math.isfinite(float(options.get(key, -1))) or float(options[key]) < 0:
+                raise ValueError(f"{key} must be finite and non-negative")
+        if int(options["smiles_dim"]) % int(options["smiles_heads"]):
+            raise ValueError("smiles_dim must be divisible by smiles_heads")
     if args.smoke_test:
         if args.prepare_only or args.resume:
             raise ValueError("smoke-test cannot be combined with prepare-only or resume")
@@ -660,10 +889,17 @@ def main() -> None:
             source, int(dataset.manifest["metadata_dim"]), **build_kwargs)
     else:
         cloud, encoder = build_relative_models(source, int(dataset.manifest["metadata_dim"]), **build_kwargs)
+    if token_mode:
+        gaussian_audit = configure_conditional_gaussian_tokens(cloud, options)
+        audit = {**audit, **gaussian_audit}
+    warm_start_text_state = None
+    warm_start_vocabulary = None
     if args.warm_start:
         weights = torch.load(args.warm_start, map_location="cpu", weights_only=False)
         cloud.load_state_dict(weights["cloud"], strict=True)
         encoder.load_state_dict(weights["condition_encoder"], strict=True)
+        warm_start_text_state = weights.get("parallel_smiles")
+        warm_start_vocabulary = weights.get("smiles_vocabulary")
         del weights
     if not args.from_scratch and "refine_depth" in options:
         depth = int(options["refine_depth"])
@@ -671,7 +907,37 @@ def main() -> None:
             raise ValueError("pretrained refine_depth can only retain existing blocks")
         cloud.refine_blocks = torch.nn.ModuleList(list(cloud.refine_blocks[:depth]))
         config["model"]["refine_depth"] = depth
+    tokenizer, text_model, smiles_token_lengths = None, None, None
+    if text_enabled:
+        smiles_values = list(dataset.iter_smiles())
+        vocabulary = (warm_start_vocabulary or
+                      (source.get("smiles_vocabulary") if source is not None else None))
+        tokenizer = (SmilesTokenizer(vocabulary) if vocabulary is not None
+                     else SmilesTokenizer.from_smiles(smiles_values))
+        smiles_token_lengths = torch.tensor(
+            [len(tokenizer.encode(value)) - 1 for value in smiles_values], dtype=torch.long
+        )
+        if len(smiles_token_lengths) != len(dataset):
+            raise RuntimeError("SMILES inventory does not match the field dataset")
+        options["smiles_pad_token_id"] = tokenizer.pad_id
+        text_model = ParallelFieldToSmiles(
+            vocab_size=len(tokenizer),
+            max_length=int(options["smiles_max_length"]),
+            dim=int(options["smiles_dim"]),
+            heads=int(options["smiles_heads"]),
+            layers=int(options["smiles_layers"]),
+            image_grid_size=int(options["smiles_image_grid_size"]),
+            ff_multiplier=float(options.get("smiles_ffn_ratio", 4.0)),
+            dropout=float(options.get("smiles_dropout", 0.0)),
+        )
+        text_state = (warm_start_text_state or
+                      (source.get("parallel_smiles") if source is not None else None))
+        if text_state is not None:
+            text_model.load_state_dict(text_state, strict=True)
+        del smiles_values
     cloud, encoder = cloud.to(device), encoder.to(device)
+    if text_model is not None:
+        text_model = text_model.to(device)
     rollout = RelativeImageRolloutCloud(cloud).to(device)
     condition_module = RaggedSpectrumTokenRunner(encoder) if token_mode else RaggedSpectrumConditionRunner(encoder)
     batch_size = int(options["batch_size_per_gpu"])
@@ -679,11 +945,18 @@ def main() -> None:
     sampler_options = {"seed": seed, "rank": rank, "replicas": world,
                        "validation_fraction": float(config["training"]["validation_fraction"]),
                        "split_seed": seed + 17}
-    excluded_count, postpool_counts = 0, None
+    excluded_count, excluded_smiles_count, postpool_counts = 0, 0, None
+    eligible = torch.ones(len(dataset), dtype=torch.bool)
     if token_mode:
         postpool_counts = _postpool_peak_token_counts(dataset, 2, device, world > 1, rank)
-        eligible = postpool_counts <= int(options["max_postpool_peak_tokens"])
-        excluded_count = int((~eligible).sum())
+        ms_eligible = postpool_counts <= int(options["max_postpool_peak_tokens"])
+        eligible &= ms_eligible
+        excluded_count = int((~ms_eligible).sum())
+    if text_enabled:
+        smiles_eligible = smiles_token_lengths <= int(options["smiles_max_length"])
+        eligible &= smiles_eligible
+        excluded_smiles_count = int((~smiles_eligible).sum())
+    if token_mode or text_enabled:
         sampler_options["eligible_mask"] = eligible
     train_sampler = ShardShuffleSampler(
         dataset, split="train", batch_size=batch_size,
@@ -703,7 +976,10 @@ def main() -> None:
                                      shuffle=False, **sampler_options)
     loader_options = {"num_workers": args.workers, "pin_memory": device.type == "cuda",
                       "collate_fn": partial(collate_spectrum_field_batch,
-                                            peak_chunk_size=int(config["training"].get("peak_chunk_size", 256)))}
+                                            peak_chunk_size=int(config["training"].get("peak_chunk_size", 256)),
+                                            tokenizer=tokenizer,
+                                            max_smiles_length=(int(options["smiles_max_length"])
+                                                               if text_enabled else None))}
     train_loader = DataLoader(dataset, sampler=train_sampler, batch_size=batch_size,
                               persistent_workers=args.workers > 0, **loader_options)
     val_loader = DataLoader(dataset, sampler=val_sampler, batch_size=val_batch, **loader_options)
@@ -718,7 +994,10 @@ def main() -> None:
     distance = (None if options.get("loss_mode") == "navigation" else
                 FullBandEnergyDistance(levels=int(config["cloud_matching"]["full_band_levels"]),
                                        include_target_constant=False, unbiased=True))
-    parameters = [p for p in (*cloud.parameters(), *encoder.parameters()) if p.requires_grad]
+    model_parameters = [p for p in (*cloud.parameters(), *encoder.parameters()) if p.requires_grad]
+    text_parameters = ([] if text_model is None else
+                       [p for p in text_model.parameters() if p.requires_grad])
+    parameters = [*model_parameters, *text_parameters]
     args.output.mkdir(parents=True, exist_ok=True)
     checkpoint_path = args.resume or args.checkpoint
     metadata = {"source_checkpoint": str(checkpoint_path) if checkpoint_path else None, "source_epoch": source_epoch,
@@ -728,6 +1007,7 @@ def main() -> None:
                 "torch_version": torch.__version__, "cuda_version": torch.version.cuda,
                 "strict_checkpoint_load": not token_mode, "weight_transfer": audit,
                 "image_feedback": True, "level_embedding": False, "excluded_long_ms": excluded_count,
+                "excluded_long_smiles": excluded_smiles_count,
                 "train_molecules": train_sampler.selected_count, "validation_molecules": val_sampler.selected_count,
                 "source_model": config["model"], "options": options,
                 "transition_schedule": transition_audit,
@@ -741,7 +1021,10 @@ def main() -> None:
                 "condition_attention": "ordinary-token-cross" if token_mode else "plane-CvT",
                 "effective_global_batch": batch_size * world * accumulation,
                 "cloud_parameters": sum(p.numel() for p in cloud.parameters()),
-                "condition_parameters": sum(p.numel() for p in encoder.parameters())}
+                "condition_parameters": sum(p.numel() for p in encoder.parameters()),
+                "parallel_smiles_parameters": (0 if text_model is None else
+                                                sum(p.numel() for p in text_model.parameters())),
+                "smiles_vocabulary_size": (0 if tokenizer is None else len(tokenizer))}
     metadata.update(resume_checkpoint=str(args.resume) if args.resume else None,
                     optimizer_state=("not-created-prepare-only" if args.prepare_only else
                                      "restored" if args.resume else "fresh"),
@@ -766,15 +1049,25 @@ def main() -> None:
     if bool(options["compile_rollout"]):
         torch._dynamo.config.optimize_ddp = False
         execution = torch.compile(rollout, fullgraph=True, dynamic=False)
-    runner, condition_runner = execution, condition_module
+    runner, condition_runner, text_runner = execution, condition_module, text_model
     if world > 1:
         runner = DDP(execution, device_ids=[local], static_graph=True)
         condition_runner = DDP(condition_module, device_ids=[local])
+        if text_model is not None:
+            text_runner = DDP(text_model, device_ids=[local], static_graph=True)
     optimizer, scheduler = None, None
     start_epoch, global_step, resume_microbatch = 0, 0, 0
     if not args.prepare_only:
-        optimizer = torch.optim.AdamW(parameters, lr=float(options["learning_rate"]),
-                                      weight_decay=float(options["weight_decay"]), fused=device.type == "cuda")
+        peak_lr = float(options["learning_rate"])
+        parameter_groups = [{"params": model_parameters, "lr": peak_lr,
+                             "schedule_peak_lr": peak_lr}]
+        if text_parameters:
+            text_lr = float(options["smiles_learning_rate"])
+            parameter_groups.append({"params": text_parameters, "lr": text_lr,
+                                     "schedule_peak_lr": text_lr})
+        optimizer = torch.optim.AdamW(parameter_groups, lr=peak_lr,
+                                      weight_decay=float(options["weight_decay"]),
+                                      fused=device.type == "cuda")
         if args.resume:
             resumed = resume_state
             if resumed.get("training_kind") != "relative-image-feedback-rollout":
@@ -816,7 +1109,9 @@ def main() -> None:
               if rank == 0 and not args.prepare_only else None)
     control_every = int(options.get("condition_control_every_epochs", 0))
     if control_every and args.resume and not args.prepare_only:
-        baseline = condition_control_metrics(rollout, condition_module, val_loader, schedule, options, device)
+        baseline = condition_control_metrics(
+            rollout, condition_module, val_loader, schedule, options, device, text_model,
+        )
         if writer:
             (args.output / "condition_control_baseline.json").write_text(
                 json.dumps(baseline, indent=2), encoding="utf-8")
@@ -829,7 +1124,13 @@ def main() -> None:
         train_sampler.set_epoch(epoch)
         runner.train()
         condition_runner.train()
-        totals = dict.fromkeys(loss_metric_keys(options), 0.0)
+        if text_runner is not None:
+            text_runner.train()
+        train_keys = list(loss_metric_keys(options))
+        if text_runner is not None:
+            train_keys.extend(("image_total", "smiles_total", "smiles_token_cross_entropy",
+                               "smiles_length_cross_entropy"))
+        totals = dict.fromkeys(train_keys, 0.0)
         count = 0
         window_start, window_count = time.perf_counter(), 0
         for micro, batch in enumerate(train_loader):
@@ -860,6 +1161,8 @@ def main() -> None:
                 if world > 1 and not should_step and not args.prepare_only:
                     stack.enter_context(runner.no_sync())
                     stack.enter_context(condition_runner.no_sync())
+                    if text_runner is not None:
+                        stack.enter_context(text_runner.no_sync())
                 with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     condition = _condition_from_batch(condition_runner, batch, device)
                     fields = runner(initial, **condition_arguments(condition), steps=int(options["steps"]),
@@ -874,6 +1177,11 @@ def main() -> None:
                         )
                     losses = loss_execution(fields, targets, initial, clean, distance, options,
                                             target_mean, posterior_noise_rms, noise)
+                    if text_runner is not None:
+                        token_ids = batch["token_ids"].to(device, non_blocking=True)
+                        losses, _ = add_parallel_smiles_supervision(
+                            losses, text_runner, fields[:, -1, 1:], token_ids, options,
+                        )
                 (losses["total"] / (1 if args.prepare_only else group_size)).backward()
             for key in totals:
                 totals[key] += float(losses[key].detach()) * len(clean)
@@ -929,10 +1237,12 @@ def main() -> None:
                                     if options.get("loss_mode") in ("navigation", "vp_transition_geometry") else "")
                     ustat_log = (f"ustat={float(losses['u_statistic'].detach()):.5f} "
                                  if "u_statistic" in losses else "")
+                    smiles_log = (f" smiles_ce={float(losses['smiles_token_cross_entropy'].detach()):.5f}"
+                                  if "smiles_token_cross_entropy" in losses else "")
                     print(f"epoch={epoch + 1} step={global_step} loss={float(losses['total'].detach()):.5f} "
                           f"{ustat_log}"
                           f"zero_mse={float(losses[center_key].detach()):.5f}"
-                          f"{geometry_log} speed={speed:.2f}mol/s", flush=True)
+                          f"{geometry_log}{smiles_log} speed={speed:.2f}mol/s", flush=True)
                     window_start, window_count = time.perf_counter(), 0
                 if global_step >= max_steps:
                     break
@@ -941,7 +1251,7 @@ def main() -> None:
                 parameter.grad = None
             validation, preview = validate(
                 rollout, condition_module, val_loader, schedule, distance, config, options,
-                device, max_batches=args.validation_batches,
+                device, max_batches=args.validation_batches, text_model=text_model,
             )
             if rank == 0:
                 (args.output / "benchmark.json").write_text(json.dumps(benchmark, indent=2), encoding="utf-8")
@@ -954,15 +1264,19 @@ def main() -> None:
                     plt.imsave(args.output / "preparation_zero_updates_GT_input_Zero_Random1to4.png", image)
                 print("Preparation complete: zero optimizer updates; no training checkpoint written.", flush=True)
             if control_every:
-                control = condition_control_metrics(rollout, condition_module, val_loader, schedule, options, device)
+                control = condition_control_metrics(
+                    rollout, condition_module, val_loader, schedule, options, device, text_model,
+                )
                 if rank == 0:
                     (args.output / "condition_control.json").write_text(json.dumps(control, indent=2), encoding="utf-8")
             break
         train_means = {key: _distributed_mean(value, count, device) for key, value in totals.items()}
         validation, preview = validate(rollout, condition_module, val_loader, schedule,
                                         distance, config, options, device,
-                                        max_batches=1 if args.smoke_test else None)
-        control = (condition_control_metrics(rollout, condition_module, val_loader, schedule, options, device)
+                                        max_batches=1 if args.smoke_test else None,
+                                        text_model=text_model)
+        control = (condition_control_metrics(
+                       rollout, condition_module, val_loader, schedule, options, device, text_model)
                    if control_every and ((epoch + 1) % control_every == 0 or global_step >= max_steps) else None)
         rng = {"torch": torch.get_rng_state(),
                "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None}
@@ -991,6 +1305,8 @@ def main() -> None:
             path = args.output / ("smoke.pt" if args.smoke_test else f"epoch-{epoch + 1:04d}.pt")
             temporary = path.with_suffix(".tmp")
             torch.save({"cloud": cloud.state_dict(), "condition_encoder": encoder.state_dict(),
+                        "parallel_smiles": (None if text_model is None else text_model.state_dict()),
+                        "smiles_vocabulary": (None if tokenizer is None else tokenizer.id_to_token),
                         "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                         "epoch": epoch, "global_step": global_step, "config": config,
                         "epoch_complete": micro + 1 == len(train_loader), "next_microbatch": micro + 1,
