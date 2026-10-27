@@ -155,8 +155,9 @@ def test_paired_ms_control_uses_same_noise_and_does_not_advance_rng(trainer, mon
 
 
 @pytest.mark.parametrize("split_first_transition", [False, True])
+@pytest.mark.parametrize("focused_phase", [False, True])
 def test_actual_training_stops_exactly_at_update_budget_and_preserves_resume(
-    trainer, monkeypatch, tmp_path, split_first_transition,
+    trainer, monkeypatch, tmp_path, split_first_transition, focused_phase,
 ):
     from test_navigation_training_setup import small_config
 
@@ -179,6 +180,12 @@ def test_actual_training_stops_exactly_at_update_budget_and_preserves_resume(
     config = small_config()
     config["model"]["condition_dim"] = 64
     config["training"].update(validation_fraction=.2)
+    if focused_phase:
+        # Match production's three trained convolution scales; changing their
+        # spatial grids must not add projection weights or reset Adam state.
+        config["model"]["cvt_kernel_sizes"] = [3, 5, 7]
+        config["model"]["cvt_grid_sizes"] = [8, 4, 2]
+        config["model"]["refine_gate_init"] = .1
     config["cloud_matching"] = {"full_band_levels": 3, "transition_jumps": [{"max_level": 64, "jump": 8}],
         "noise_schedule": {"type": "cosine_vp", "levels": 64, "noise_scale": 3.5, "zero_mean_noise": True}}
     options = {"token_conditioning": True, "alignment_steps": 0, "max_postpool_peak_tokens": 8192,
@@ -208,12 +215,23 @@ def test_actual_training_stops_exactly_at_update_budget_and_preserves_resume(
             (root / "configs/navigation_ustat_million_jump2.yaml").read_text(encoding="utf-8"))
         # Change only the new phase; the checkpoint must retain its old schedule.
         options = {**options, "transition_jumps": split_options["transition_jumps"]}
+    if focused_phase:
+        options = {**options, "epochs": 2, "training_updates_per_epoch": 2,
+                   "refine_depth": 8,
+                   "image_cvt_grid_sizes": [32, 16, 8],
+                   "level_embedding": True, "level_embedding_max_level": 64,
+                   "training_start_level": 64, "training_answer_level": 63,
+                   "warm_start_optimizer": True, "lr_schedule_start_step": 0,
+                   "learning_rate": 1e-5, "min_learning_rate": 1e-5,
+                   "warmup_steps": 0,
+                   "transition_jumps": [{"max_level": 64, "jump": 1}]}
     phase.write_text(yaml.safe_dump(options))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(trainer, "_postpool_peak_token_counts", lambda dataset, *_: torch.ones(len(dataset)))
     monkeypatch.setattr(trainer, "validate", lambda *_args, **_kwargs: ({"total": 0.}, torch.zeros(1, 3, 4, 28)))
     monkeypatch.setattr(trainer, "long_rollout_preview", lambda *_: None)
-    monkeypatch.setattr("sys.argv", ["train", "--data", str(spectra), "--resume", str(checkpoint),
+    monkeypatch.setattr("sys.argv", ["train", "--data", str(spectra),
+                                     "--checkpoint" if focused_phase else "--resume", str(checkpoint),
                                      "--config", str(phase), "--output", str(output), "--workers", "0"])
     previous_threads = torch.get_num_threads()
     try:
@@ -223,13 +241,28 @@ def test_actual_training_stops_exactly_at_update_budget_and_preserves_resume(
         torch.set_num_threads(previous_threads)
     result = torch.load(output / "latest.pt", weights_only=False)
     assert result["global_step"] == 3
-    assert result["next_microbatch"] == 3 and not result["epoch_complete"]
+    assert result["next_microbatch"] == (1 if focused_phase else 3) and not result["epoch_complete"]
     assert result["scheduler"]["last_epoch"] == 3
     assert len(result["rng_states"]) == 1
-    assert max(float(state["step"]) for state in result["optimizer"]["state"].values()) == 3
+    assert max(float(state["step"]) for state in result["optimizer"]["state"].values()) == (4 if focused_phase else 3)
     assert json.loads((output / "training_finished.json").read_text())["target_reached"]
-    audit = json.loads((output / "resume_state.json").read_text())
-    assert audit["source_global_step"] == 1 and audit["optimizer_state_restored"]
+    if focused_phase:
+        assert (output / "epoch-0001.pt").exists() and result["epoch"] == 1
+        first = torch.load(output / "epoch-0001.pt", weights_only=False)
+        assert first["global_step"] == 2 and first["epoch_complete"]
+        assert result["parent_global_step"] == 1
+        assert result["config"]["model"]["cvt_grid_sizes"] == [32, 16, 8]
+        assert result["config"]["relative_image_rollout"]["level_embedding"]
+        fresh = json.loads((output / "optimizer_transfer.json").read_text())["fresh_parameters"]
+        assert sum(name.startswith("cloud.level_conditioner.") for name in fresh) == 4
+        assert any(name.startswith("cloud.refine_blocks.7.") for name in fresh)
+        restored, _, _ = restore_token_relative_models(result, 3, gradient_checkpointing=False)
+        assert restored.level_conditioner is not None and len(restored.refine_blocks) == 8
+        assert result["optimizer"]["param_groups"][0]["lr"] == pytest.approx(1e-5)
+        assert json.loads((output / "preparation.json").read_text())["optimizer_state"] == "restored-new-phase"
+    else:
+        audit = json.loads((output / "resume_state.json").read_text())
+        assert audit["source_global_step"] == 1 and audit["optimizer_state_restored"]
     if split_first_transition:
         assert result["config"]["cloud_matching"]["transition_jumps"] == options["transition_jumps"]
         preparation = json.loads((output / "preparation.json").read_text())

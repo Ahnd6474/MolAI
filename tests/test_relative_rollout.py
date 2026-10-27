@@ -13,6 +13,7 @@ from molai.models.relative_rollout import (
     build_relative_models,
     build_token_relative_models,
     configure_conditional_gaussian_tokens,
+    configure_relative_image_grids,
 )
 
 
@@ -23,6 +24,31 @@ def small_cloud():
         cvt_grid_sizes=(4, 2, 1), max_resolution=16,
         zero_mean_output=True, gradient_checkpointing=False,
     )
+
+
+def test_image_grid_change_preserves_weights_and_does_not_change_other_attention():
+    cloud = small_cloud()
+    config = {"model": {"cvt_grid_sizes": [4, 2, 1]}}
+    before = {name: value.clone() for name, value in cloud.state_dict().items()}
+    parameters = list(cloud.parameters())
+    cross_grids = cloud.condition_blocks[0].attention.grid_sizes
+    audit = configure_relative_image_grids(cloud, config, [32, 16, 8])
+    assert audit["kv_tokens_at_128"] == 1344 and not audit["parameters_replaced"]
+    assert config["model"]["cvt_grid_sizes"] == [32, 16, 8]
+    assert cloud.field_encoder.attention.grid_sizes == (32, 16, 8)
+    assert cloud.refine_blocks[0].attention.grid_sizes == (32, 16, 8)
+    assert cloud.condition_blocks[0].attention.grid_sizes == cross_grids
+    assert all(left is right for left, right in zip(parameters, cloud.parameters(), strict=True))
+    for name, value in cloud.state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+    context = torch.randn(1, 128, 128, cloud.dim)
+    assert cloud.refine_blocks[0].attention.pool_context(context).shape == (1, 1344, cloud.dim)
+    initial = torch.randn(1, 1, 8, 8, requires_grad=True)
+    fields = cloud(initial, torch.randn(1, 16), samples=2)[0]
+    fields.square().mean().backward()
+    assert initial.grad is not None and torch.isfinite(initial.grad).all()
+    with pytest.raises(ValueError, match="scale count"):
+        configure_relative_image_grids(cloud, config, [32, 16])
 
 
 def test_relative_rollout_matches_explicit_image_feedback_and_preserves_gradient():

@@ -8,7 +8,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from molai.models.attention import TokenCrossBlock2d, sinusoidal_2d_position
+from molai.models.attention import CvTMixerBlock, TokenCrossBlock2d, sinusoidal_2d_position
 from molai.models.cloud import MolecularFieldCloud
 from molai.models.condition import SpectrumConditionEncoder, SpectrumTokenEncoder
 
@@ -234,6 +234,85 @@ def build_relative_models(
     return cloud, encoder
 
 
+class VPLevelConditioning(nn.Module):
+    """Zero-initialized feature-wise VP-time conditioning; CvT stays untouched."""
+
+    def __init__(self, dim: int, refine_depth: int, max_level: int = 64):
+        super().__init__()
+        if max_level < 1:
+            raise ValueError("max_level must be positive")
+        self.dim, self.max_level = dim, max_level
+        self.mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.SiLU(),
+                                 nn.Linear(dim * 4, (refine_depth + 1) * 2 * dim))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, levels: Tensor) -> Tensor:
+        half = self.dim // 2
+        frequency = torch.exp(torch.arange(half, device=levels.device, dtype=torch.float32)
+                              * (-math.log(10000.) / max(half - 1, 1)))
+        phase = levels.float()[:, None] * (1000. / self.max_level) * frequency
+        embedding = torch.cat((phase.cos(), phase.sin()), dim=-1)
+        return self.mlp(embedding).reshape(len(levels), -1, 2, self.dim)
+
+
+def configure_relative_level_conditioning(cloud, options):
+    enabled = bool(options.get("level_embedding", False))
+    if not enabled:
+        if cloud.level_conditioner is not None:
+            raise ValueError("cannot disable a checkpoint's level conditioning")
+        return {"level_embedding": False}
+    maximum = int(options.get("level_embedding_max_level", 64))
+    if cloud.level_conditioner is None:
+        cloud.level_conditioner = VPLevelConditioning(cloud.dim, len(cloud.refine_blocks), maximum)
+        origin = "new-zero-initialized"
+    else:
+        if cloud.level_conditioner.max_level != maximum:
+            raise ValueError("cannot change a checkpoint's maximum conditioning level")
+        origin = "restored"
+    return {"level_embedding": True, "level_conditioner": origin,
+            "level_embedding_dim": cloud.dim, "level_embedding_max_level": maximum,
+            "level_injection": "image-encoder-output-and-before-each-unchanged-CvT-refine"}
+
+
+def expand_relative_refine_depth(cloud, config, depth):
+    """Append identity-initialized CvT blocks; retain old FiLM rows and tensors."""
+    previous = len(cloud.refine_blocks)
+    if depth < previous:
+        raise ValueError("refine expansion cannot remove pretrained blocks")
+    if depth == previous:
+        return {"previous_depth": previous, "new_depth": depth, "added_blocks": 0}
+    if any(block.attention_gate is None or block.ffn_gate is None for block in cloud.refine_blocks):
+        raise ValueError("identity expansion requires a scalar-gated pretrained refine stack")
+    options = config["model"]
+    reference = next(cloud.refine_blocks.parameters())
+    for _ in range(previous, depth):
+        block = CvTMixerBlock(
+            cloud.dim, int(options["heads"]), float(options["ffn_ratio"]),
+            kernel_sizes=tuple(options["cvt_kernel_sizes"]),
+            grid_sizes=cloud.refine_blocks[0].attention.grid_sizes,
+            residual_gate_init=0.0,
+        ).to(device=reference.device, dtype=reference.dtype)
+        cloud.refine_blocks.append(block)
+    conditioner = getattr(cloud, "level_conditioner", None)
+    expanded_parameters = []
+    if conditioner is not None:
+        old = conditioner.mlp[-1]
+        rows = (depth + 1) * 2 * cloud.dim
+        new = nn.Linear(old.in_features, rows).to(device=old.weight.device, dtype=old.weight.dtype)
+        with torch.no_grad():
+            new.weight.zero_()
+            new.bias.zero_()
+            new.weight[:old.out_features].copy_(old.weight)
+            new.bias[:old.out_features].copy_(old.bias)
+        conditioner.mlp[-1] = new
+        expanded_parameters = ["cloud.level_conditioner.mlp.2.weight", "cloud.level_conditioner.mlp.2.bias"]
+    config["model"]["refine_depth"] = depth
+    return {"previous_depth": previous, "new_depth": depth, "added_blocks": depth - previous,
+            "new_attention_and_ffn_gates": 0.0, "expanded_parameters": expanded_parameters,
+            "existing_blocks_preserved": True, "new_level_modulation_rows": "zero"}
+
+
 class TokenConditionRelativeCloud(MolecularFieldCloud):
     """Retain the pretrained image residual; query real MS tokens, not a plane."""
 
@@ -244,6 +323,7 @@ class TokenConditionRelativeCloud(MolecularFieldCloud):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.random_token_controller: ConditionalGaussianTokenController | None = None
+        self.level_conditioner: VPLevelConditioning | None = None
 
     def _run(self, module, *args):
         skip = self.uncheckpointed_refine_blocks
@@ -288,21 +368,31 @@ class TokenConditionRelativeCloud(MolecularFieldCloud):
         return self.apply_condition(self.encode_image(current), tokens, mask, prepared)
 
     def forward(self, current, condition, samples=4, noise=None, condition_mask=None,
-                prepared_condition=None):
-        if self.random_token_controller is None:
+                prepared_condition=None, current_levels=None):
+        if self.random_token_controller is None and self.level_conditioner is None:
             return super().forward(
                 current, (condition, condition_mask, prepared_condition), samples, noise,
             )
         if condition_mask is None or condition_mask.shape != condition.shape[:2]:
             raise ValueError("conditional Gaussian tokens require a matching MS mask")
         image_hidden = self.encode_image(current)
+        modulation = None
+        if self.level_conditioner is not None:
+            if current_levels is None or current_levels.shape != (len(current),):
+                raise ValueError("level-conditioned Cloud requires current_levels [B]")
+            modulation = self.level_conditioner(current_levels).to(image_hidden.dtype)
+            scale, shift = modulation[:, 0].unbind(dim=1)
+            image_hidden = image_hidden * (1 + scale[:, None, None]) + shift[:, None, None]
         encoded = self.apply_condition(image_hidden, condition, condition_mask, prepared_condition)
         energy = self.spatial_noise_energy(encoded)
         epsilon = self._prepare_noise(encoded, samples, noise)
-        mean, sigma = self._run(
-            self.random_token_controller, condition, condition_mask, image_hidden,
-        )
-        gaussian_tokens = mean[:, None, None, :] + sigma[:, None, None, :] * epsilon
+        if self.random_token_controller is not None:
+            mean, sigma = self._run(
+                self.random_token_controller, condition, condition_mask, image_hidden,
+            )
+            gaussian_tokens = mean[:, None, None, :] + sigma[:, None, None, :] * epsilon
+        else:
+            gaussian_tokens = epsilon
 
         batch, height, width, _ = encoded.shape
         tokens = encoded[:, None].expand(-1, samples, -1, -1, -1)
@@ -314,7 +404,10 @@ class TokenConditionRelativeCloud(MolecularFieldCloud):
         spatial_amplitude = spatial_amplitude[:, None].expand(-1, samples, -1, -1)
         spatial_amplitude = spatial_amplitude.reshape(batch * samples, height, width)
         tokens = self._run(self.noise_attention, tokens, random_context, spatial_amplitude)
-        for block in self.refine_blocks:
+        for index, block in enumerate(self.refine_blocks):
+            if modulation is not None:
+                scale, shift = modulation[:, index + 1].repeat_interleave(samples, dim=0).unbind(dim=1)
+                tokens = tokens * (1 + scale[:, None, None]) + shift[:, None, None]
             tokens = self._run(block, tokens)
 
         residual = self.output_head(self.output_norm(tokens)).permute(0, 3, 1, 2)
@@ -442,6 +535,7 @@ def build_fresh_token_relative_models(config: dict, metadata_dim: int, *, gradie
     gaussian_audit = configure_conditional_gaussian_tokens(
         cloud, config.get("relative_image_rollout", {}),
     )
+    level_audit = configure_relative_level_conditioning(cloud, config.get("relative_image_rollout", {}))
     cloud.readout.requires_grad_(False)
     spectrum = dict(config["spectrum_encoder"])
     spectrum.update(heads=4, peak_conv_stages=2, spectrum_layers=2)
@@ -455,6 +549,7 @@ def build_fresh_token_relative_models(config: dict, metadata_dim: int, *, gradie
         "random_attention": "conditional-gaussian" if gaussian_audit["conditional_gaussian_tokens"]
         else "historical-scalar-gate",
         **gaussian_audit,
+        **level_audit,
     }
 
 
@@ -510,6 +605,30 @@ def restore_token_relative_models(checkpoint: dict, metadata_dim: int, *, gradie
                             "loaded_ms_tensors": len(checkpoint["condition_encoder"])}
 
 
+def configure_relative_image_grids(cloud, config, grid_sizes):
+    """Change image encoder/refine K/V grids while preserving trained tensors."""
+    modules = [("field_encoder", cloud.field_encoder.attention)]
+    modules.extend((f"refine_blocks.{index}", block.attention)
+                   for index, block in enumerate(cloud.refine_blocks))
+    grids = tuple(int(size) for size in grid_sizes)
+    if any(size < 1 for size in grids) or any(
+        len(grids) != len(module.context_convolutions) for _, module in modules
+    ):
+        raise ValueError("image CvT grids must be positive and match the existing scale count")
+    parameter_ids = {name: id(parameter) for name, parameter in cloud.named_parameters()}
+    previous = {name: list(module.grid_sizes) for name, module in modules}
+    for _, module in modules:
+        module.grid_sizes = grids
+    config["model"]["cvt_grid_sizes"] = list(grids)
+    config["model"].pop("cvt_output_sizes", None)
+    if parameter_ids != {name: id(parameter) for name, parameter in cloud.named_parameters()}:
+        raise RuntimeError("image grid change replaced trained parameters")
+    return {"previous_grids": previous, "new_grids": list(grids),
+            "changed_modules": [name for name, _ in modules],
+            "kv_tokens_at_128": modules[0][1].pooled_token_count(128, 128),
+            "parameters_replaced": False}
+
+
 def configure_relative_execution(cloud, options):
     """Execution-only knobs: no changes to parameters, paths, grids, or objective."""
     cloud.cache_condition_kv = bool(options.get("cache_ms_kv", False))
@@ -551,10 +670,14 @@ class RelativeImageRolloutCloud(nn.Module):
     def forward(
         self, initial: Tensor, condition: Tensor, *, steps: int = 4,
         random_samples: int = 4, noise: Tensor | None = None, condition_mask: Tensor | None = None,
+        current_levels: Tensor | None = None,
     ) -> Tensor:
         if steps < 1 or random_samples < 2:
             raise ValueError("steps must be positive and U-stat needs at least two random paths")
         token_conditioning = isinstance(self.cloud, TokenConditionRelativeCloud)
+        level_conditioning = getattr(self.cloud, "level_conditioner", None) is not None
+        if level_conditioning and (current_levels is None or current_levels.shape != (len(initial), steps)):
+            raise ValueError("level-conditioned rollout requires current_levels [B,T]")
         if initial.ndim != 4 or condition.ndim != (3 if token_conditioning else 2) or condition.shape[0] != initial.shape[0]:
             raise ValueError("condition must match the cloud's vector/token interface")
         if token_conditioning and (condition_mask is None or condition_mask.shape != condition.shape[:2]):
@@ -580,12 +703,16 @@ class RelativeImageRolloutCloud(nn.Module):
         current = initial
         for step in range(steps):
             if step == 0:
-                fields, _, _ = self.cloud(current, condition, samples=paths, noise=noise[:, step], **first_kwargs)
+                level_kwargs = {"current_levels": current_levels[:, step]} if level_conditioning else {}
+                fields, _, _ = self.cloud(current, condition, samples=paths, noise=noise[:, step],
+                                          **first_kwargs, **level_kwargs)
             else:
+                level_kwargs = ({"current_levels": current_levels[:, step].repeat_interleave(paths)}
+                                if level_conditioning else {})
                 fields, _, _ = self.cloud(
                     current.flatten(0, 1), expanded_condition, samples=1,
                     noise=noise[:, step].reshape(batch * paths, 1, *noise.shape[-2:]),
-                    **later_kwargs,
+                    **later_kwargs, **level_kwargs,
                 )
                 fields = fields[:, 0].reshape(batch, paths, *initial.shape[1:])
             current = fields  # Deliberately no detach: later losses train earlier corrections.

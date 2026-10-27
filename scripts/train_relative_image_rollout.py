@@ -52,6 +52,9 @@ from molai.models.relative_rollout import (
     build_relative_models,
     build_token_relative_models,
     configure_conditional_gaussian_tokens,
+    configure_relative_image_grids,
+    configure_relative_level_conditioning,
+    expand_relative_refine_depth,
     configure_relative_execution,
     restore_token_relative_models,
 )
@@ -62,6 +65,78 @@ def condition_arguments(condition):
     if isinstance(condition, tuple):
         return {"condition": condition[0], "condition_mask": condition[1]}
     return {"condition": condition}
+
+
+def level_arguments(cloud, start, answer_levels=None, *, steps=None):
+    if getattr(cloud, "level_conditioner", None) is None:
+        return {}
+    before = (torch.cat((start[:, None], answer_levels[:, :-1]), dim=1)
+              if answer_levels is not None else
+              (start[:, None] - torch.arange(steps, device=start.device)).clamp_min(0))
+    return {"current_levels": before}
+
+
+def optimizer_parameter_names(cloud, encoder, text_model):
+    groups = [[f"cloud.{name}" for name, p in cloud.named_parameters() if p.requires_grad]
+              + [f"condition_encoder.{name}" for name, p in encoder.named_parameters() if p.requires_grad]]
+    if text_model is not None:
+        groups.append([f"parallel_smiles.{name}" for name, p in text_model.named_parameters() if p.requires_grad])
+    return groups
+
+
+def restore_optimizer_adding_level_parameters(optimizer, saved, names, source_names):
+    """Retain named Adam states; allow only new time/CvT layers and zero-padded FiLM rows."""
+    state = optimizer.state_dict()
+    if len(saved["param_groups"]) != len(state["param_groups"]):
+        raise ValueError("optimizer group count changed")
+    remapped = {"state": {}, "param_groups": []}
+    added, expanded = [], []
+    for old_group, group, group_names, old_names in zip(
+        saved["param_groups"], state["param_groups"], names, source_names, strict=True,
+    ):
+        if len(old_names) != len(old_group["params"]) or len(group_names) != len(group["params"]):
+            raise ValueError("optimizer parameter-name inventory does not match saved groups")
+        lookup = dict(zip(group_names, group["params"], strict=True))
+        if set(old_names) - set(lookup):
+            raise ValueError("optimizer migration would drop a trained parameter")
+        new_names = set(group_names) - set(old_names)
+        old_blocks = [int(name.split(".")[2]) for name in old_names if name.startswith("cloud.refine_blocks.")]
+        old_depth = max(old_blocks, default=-1) + 1
+        def allowed(name):
+            return (name.startswith("cloud.level_conditioner.") or
+                    (name.startswith("cloud.refine_blocks.") and int(name.split(".")[2]) >= old_depth))
+        if any(not allowed(name) for name in new_names):
+            raise ValueError("only new level-conditioning or appended refine parameters may lack optimizer state")
+        added.extend(sorted(new_names))
+        current_parameters = dict(zip(group_names, optimizer.param_groups[len(remapped["param_groups"])]["params"], strict=True))
+        for name, old_id in zip(old_names, old_group["params"], strict=True):
+            if old_id in saved["state"]:
+                old_state = saved["state"][old_id]
+                parameter = current_parameters[name]
+                moment = old_state.get("exp_avg")
+                if moment is not None and moment.shape != parameter.shape:
+                    if (name not in ("cloud.level_conditioner.mlp.2.weight", "cloud.level_conditioner.mlp.2.bias")
+                            or moment.ndim != parameter.ndim or moment.shape[1:] != parameter.shape[1:]
+                            or moment.shape[0] >= parameter.shape[0]):
+                        raise ValueError("only appended level-modulation rows may expand saved Adam moments")
+                    old_state = dict(old_state)
+                    for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                        if key in old_state:
+                            padded = old_state[key].new_zeros(parameter.shape)
+                            padded[:moment.shape[0]].copy_(old_state[key])
+                            old_state[key] = padded
+                    expanded.append({"name": name, "previous_shape": list(moment.shape),
+                                     "new_shape": list(parameter.shape), "new_moments": "zero"})
+                remapped["state"][lookup[name]] = old_state
+        remapped["param_groups"].append({**old_group, "params": group["params"]})
+    optimizer.load_state_dict(remapped)
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            moment = optimizer.state.get(parameter, {}).get("exp_avg")
+            if moment is not None and moment.shape != parameter.shape:
+                raise ValueError("restored Adam moment shape does not match its parameter")
+    return {"restored_parameter_states": len(remapped["state"]), "fresh_parameters": added,
+            "expanded_parameter_states": expanded}
 
 
 def apply_transition_schedule(config, options):
@@ -411,10 +486,64 @@ def color_preview(clean: Tensor, initial: Tensor, fields: Tensor) -> Tensor:
 def sampled_validation_levels(schedule, batch_size, device, options):
     mode = options.get("validation_start_levels", "pure_noise")
     if mode == "uniform":
-        return torch.randint(0, len(schedule.alpha_bar), (batch_size,), device=device)
+        lower = int(options.get("validation_min_start_level", 0))
+        upper = int(options.get("validation_max_start_level", len(schedule.alpha_bar) - 1))
+        if not 0 <= lower <= upper < len(schedule.alpha_bar):
+            raise ValueError("validation level bounds must fit within the VP schedule")
+        return torch.randint(lower, upper + 1, (batch_size,), device=device)
     if mode == "pure_noise":
         return torch.full((batch_size,), len(schedule.alpha_bar) - 1, device=device)
     raise ValueError("validation_start_levels must be uniform or pure_noise")
+
+
+def training_level_probabilities(schedule, device, options):
+    mixture = options.get("training_level_mixture")
+    difficulty = options.get("training_level_difficulty")
+    if difficulty is not None:
+        if mixture is not None or options.get("training_start_level") is not None:
+            raise ValueError("training_level_difficulty requires no mixture or fixed start")
+        floor = float(difficulty.get("signal_floor", .01))
+        uniform = float(difficulty.get("uniform_fraction", .2))
+        power = float(difficulty.get("power", 1.))
+        if not math.isfinite(floor) or floor <= 0 or not 0 < uniform <= 1:
+            raise ValueError("difficulty signal_floor must be positive and uniform_fraction in (0, 1]")
+        if not math.isfinite(power) or power <= 0:
+            raise ValueError("difficulty power must be finite and positive")
+        alpha = schedule.alpha_bar.detach().float().to(device)
+        weights = (alpha + floor).pow(-power)
+        return uniform / len(alpha) + (1 - uniform) * weights / weights.sum()
+    if mixture is None:
+        return None
+    if options.get("training_start_level") is not None:
+        raise ValueError("training_level_mixture cannot be combined with training_start_level")
+    weights = [0.0] * len(schedule.alpha_bar)
+    for component in mixture:
+        lower, upper = int(component["min_level"]), int(component["max_level"])
+        probability = float(component["probability"])
+        if not 0 <= lower <= upper < len(weights):
+            raise ValueError("training mixture level bounds must fit within the VP schedule")
+        if not math.isfinite(probability) or probability < 0:
+            raise ValueError("training mixture probabilities must be finite and non-negative")
+        for level in range(lower, upper + 1):
+            weights[level] += probability / (upper - lower + 1)
+    total = sum(weights)
+    if total <= 0:
+        raise ValueError("training mixture must have positive total probability")
+    return torch.tensor([weight / total for weight in weights], device=device)
+
+
+def sampled_training_levels(schedule, batch_size, device, options, probabilities=None):
+    if probabilities is None:
+        probabilities = training_level_probabilities(schedule, device, options)
+    if probabilities is not None:
+        return torch.multinomial(probabilities, batch_size, replacement=True)
+    fixed = options.get("training_start_level")
+    if fixed is None:
+        return torch.randint(0, len(schedule.alpha_bar), (batch_size,), device=device)
+    level = int(fixed)
+    if not 0 <= level < len(schedule.alpha_bar):
+        raise ValueError("training_start_level must fit within the VP schedule")
+    return torch.full((batch_size,), level, device=device, dtype=torch.long)
 
 
 @torch.no_grad()
@@ -436,12 +565,14 @@ def long_rollout_preview(rollout, condition_runner, loader, schedule, options, d
             condition = _condition_from_batch(condition_runner, batch, device)
             condition = tuple(value[:len(clean)] for value in condition) if isinstance(condition, tuple) else condition[:len(clean)]
             fields = rollout(initial, **condition_arguments(condition), steps=steps,
-                             random_samples=int(options["random_samples"]), noise=noise)
+                             random_samples=int(options["random_samples"]), noise=noise,
+                             **level_arguments(rollout.cloud, start, steps=steps))
         if options.get("loss_mode") == "zero_current_global_vp_ustat":
             # Zero estimates THIS level's signal and is not a transition sampler.
             # Long generation previews therefore show only the Random paths.
             fields = fields[:, :, 1:]
-        selected = sorted({step for step in (1, 2, 4, 8, 12, 16, steps) if step <= steps})
+        checkpoints = (1, 2, 4, 8, 12, 16, steps) if steps <= 23 else (1, 2, 4, 8, 16, 32, 48, steps)
+        selected = sorted({step for step in checkpoints if step <= steps})
         # One image per molecule/path: GT, initial, then selected rollout states.
         panels = torch.cat((clean[:, None, None].expand(-1, fields.shape[2], 1, -1, -1, -1),
                             initial[:, None, None].expand(-1, fields.shape[2], 1, -1, -1, -1),
@@ -518,7 +649,8 @@ def condition_control_metrics(
                 shuffled = tuple(value.roll(1, dims=0) for value in condition)
                 for name, current_condition in (("true", condition), ("shuffled", shuffled)):
                     final = rollout(initial, **condition_arguments(current_condition), steps=steps,
-                                    random_samples=samples, noise=noise)[:, -1].float()
+                                    random_samples=samples, noise=noise,
+                                    **level_arguments(rollout.cloud, start, steps=steps))[:, -1].float()
                     centered = final.flatten(2) - final.flatten(2).mean(dim=2, keepdim=True)
                     truth = clean.float().flatten(1)
                     truth = truth - truth.mean(dim=1, keepdim=True)
@@ -662,7 +794,8 @@ def validate(
             with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 condition = _condition_from_batch(condition_runner, batch, device)
                 fields = rollout(initial, **condition_arguments(condition), steps=int(options["validation_steps"]),
-                                 random_samples=int(options["random_samples"]), noise=noise)
+                                 random_samples=int(options["random_samples"]), noise=noise,
+                                 **level_arguments(rollout.cloud, start, levels))
                 if options.get("loss_mode") == "zero_current_global_vp_ustat":
                     targets, target_mean, posterior_noise_rms = current_mean_global_vp_targets(
                         schedule, clean, start, levels, int(options["random_samples"]))
@@ -750,6 +883,27 @@ def validate(
     return result, preview
 
 
+def validation_suite(rollout, condition_runner, loader, schedule, distance,
+                     config, options, device, *, max_batches=None, text_model=None):
+    """Primary validation plus fixed-seed retention checks for focused phases."""
+    primary_limit = options.get("validation_max_batches") if max_batches is None else max_batches
+    result, preview = validate(rollout, condition_runner, loader, schedule, distance,
+                               config, options, device, max_batches=primary_limit,
+                               text_model=text_model)
+    selected = ("total", "image_total", "zero_mean_mse", "u_statistic_corrected",
+                "u_statistic_target_floor", "final_zero_correlation",
+                "final_random_correlation", "diversity_ratio",
+                "smiles_token_accuracy", "smiles_exact_match", "smiles_best_of_4_exact_match")
+    for name, overrides in options.get("validation_suites", {}).items():
+        suite_options = {**options, **overrides}
+        metrics, _ = validate(
+            rollout, condition_runner, loader, schedule, distance, config, suite_options,
+            device, max_batches=overrides.get("max_batches", primary_limit), text_model=text_model,
+        )
+        result.update({f"{name}/{key}": metrics[key] for key in selected if key in metrics})
+    return result, preview
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, required=True)
@@ -811,6 +965,8 @@ def main() -> None:
             replacement = yaml.safe_load(args.model_config.read_text(encoding="utf-8"))
             config["spectrum_encoder"] = copy.deepcopy(replacement["spectrum_encoder"])
     options = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    if "training_seed" in options and not args.resume:
+        torch.manual_seed(int(options["training_seed"]) + rank)
     transition_audit = apply_transition_schedule(config, options)
     bind_spectrum_metadata(config["spectrum_encoder"], dataset.manifest)
     loss_metric_keys(options)
@@ -903,10 +1059,27 @@ def main() -> None:
         del weights
     if not args.from_scratch and "refine_depth" in options:
         depth = int(options["refine_depth"])
-        if not 1 <= depth <= len(cloud.refine_blocks):
-            raise ValueError("pretrained refine_depth can only retain existing blocks")
-        cloud.refine_blocks = torch.nn.ModuleList(list(cloud.refine_blocks[:depth]))
-        config["model"]["refine_depth"] = depth
+        if depth < 1:
+            raise ValueError("refine_depth must be positive")
+        if depth > len(cloud.refine_blocks):
+            audit["refine_expansion"] = expand_relative_refine_depth(cloud, config, depth)
+        else:
+            if depth < len(cloud.refine_blocks) and getattr(cloud, "level_conditioner", None) is not None:
+                raise ValueError("cannot truncate a pretrained level-conditioned refine stack")
+            cloud.refine_blocks = torch.nn.ModuleList(list(cloud.refine_blocks[:depth]))
+            config["model"]["refine_depth"] = depth
+    if "image_cvt_grid_sizes" in options:
+        audit["image_cvt_grid_change"] = configure_relative_image_grids(
+            cloud, config, options["image_cvt_grid_sizes"],
+        )
+    if token_mode:
+        audit["level_conditioning"] = configure_relative_level_conditioning(cloud, options)
+        if options.get("level_embedding", False):
+            maximum = int(config["cloud_matching"]["noise_schedule"]["levels"])
+            if (maximum != cloud.level_conditioner.max_level or
+                    not torch.equal(_transition_jumps(torch.arange(1, maximum + 1), config),
+                                    torch.ones(maximum, dtype=torch.long))):
+                raise ValueError("level-conditioned training currently requires jump=1 over every level")
     tokenizer, text_model, smiles_token_lengths = None, None, None
     if text_enabled:
         smiles_values = list(dataset.iter_smiles())
@@ -984,6 +1157,11 @@ def main() -> None:
                               persistent_workers=args.workers > 0, **loader_options)
     val_loader = DataLoader(dataset, sampler=val_sampler, batch_size=val_batch, **loader_options)
     epoch_updates = math.ceil(len(train_loader) / accumulation)
+    updates_per_epoch = int(options.get("training_updates_per_epoch", epoch_updates))
+    if not 1 <= updates_per_epoch <= epoch_updates:
+        raise ValueError("training_updates_per_epoch must fit within the data loader")
+    epoch_microbatches = min(len(train_loader), updates_per_epoch * accumulation)
+    epoch_updates = updates_per_epoch
     max_steps = int(options.get("max_steps", int(options["epochs"]) * epoch_updates))
     if max_steps < 1 or max_steps > int(options["epochs"]) * epoch_updates:
         raise ValueError("max_steps must fit within the configured epochs")
@@ -991,6 +1169,13 @@ def main() -> None:
     if not isinstance(schedule, CosineVPSchedule):
         raise TypeError("relative multi-step fine-tuning requires the original cosine VP schedule")
     options["zero_mean_noise"] = schedule.zero_mean_noise
+    level_probabilities = training_level_probabilities(schedule, device, options)
+    if options.get("training_start_level") is not None:
+        fixed_start = sampled_training_levels(schedule, 1, device, options)
+        expected = options.get("training_answer_level")
+        actual = int((fixed_start - _transition_jumps(fixed_start, config)).clamp_min(0).item())
+        if expected is not None and actual != int(expected):
+            raise ValueError(f"focused training targets L{actual}, expected L{expected}")
     distance = (None if options.get("loss_mode") == "navigation" else
                 FullBandEnergyDistance(levels=int(config["cloud_matching"]["full_band_levels"]),
                                        include_target_constant=False, unbiased=True))
@@ -1006,7 +1191,8 @@ def main() -> None:
                 "aligned_warm_start": str(args.warm_start) if args.warm_start else None,
                 "torch_version": torch.__version__, "cuda_version": torch.version.cuda,
                 "strict_checkpoint_load": not token_mode, "weight_transfer": audit,
-                "image_feedback": True, "level_embedding": False, "excluded_long_ms": excluded_count,
+                "image_feedback": True, "level_embedding": bool(options.get("level_embedding", False)),
+                "excluded_long_ms": excluded_count,
                 "excluded_long_smiles": excluded_smiles_count,
                 "train_molecules": train_sampler.selected_count, "validation_molecules": val_sampler.selected_count,
                 "source_model": config["model"], "options": options,
@@ -1020,15 +1206,35 @@ def main() -> None:
                 "actual_condition_dim": 64 if token_mode else config["model"]["condition_dim"],
                 "condition_attention": "ordinary-token-cross" if token_mode else "plane-CvT",
                 "effective_global_batch": batch_size * world * accumulation,
+                "training_level_probabilities": (None if level_probabilities is None else
+                                                 level_probabilities.cpu().tolist()),
                 "cloud_parameters": sum(p.numel() for p in cloud.parameters()),
                 "condition_parameters": sum(p.numel() for p in encoder.parameters()),
                 "parallel_smiles_parameters": (0 if text_model is None else
                                                 sum(p.numel() for p in text_model.parameters())),
                 "smiles_vocabulary_size": (0 if tokenizer is None else len(tokenizer))}
+    phase_optimizer = None
+    parameter_names = optimizer_parameter_names(cloud, encoder, text_model)
+    source_parameter_names = None
+    if source is not None:
+        source_parameter_names = source.get("optimizer_parameter_names")
+        if source_parameter_names is None:
+            source_parameter_names = [
+                [name for name in group if name.split(".", 1)[1] in source[name.split(".", 1)[0]]]
+                for group in parameter_names
+            ]
+    if options.get("warm_start_optimizer", False) and not args.resume:
+        if source is None or args.warm_start or args.reset_ms_encoder:
+            raise ValueError("warm_start_optimizer requires an unchanged --checkpoint model")
+        phase_optimizer = source["optimizer"]
+    parent_global_step = (int(source.get("parent_global_step", source.get("global_step", 0)))
+                          if args.resume else int(source.get("global_step", 0))) if source is not None else 0
     metadata.update(resume_checkpoint=str(args.resume) if args.resume else None,
                     optimizer_state=("not-created-prepare-only" if args.prepare_only else
-                                     "restored" if args.resume else "fresh"),
+                                     "restored" if args.resume else
+                                     "restored-new-phase" if phase_optimizer is not None else "fresh"),
                     updates_per_epoch=epoch_updates, max_steps=max_steps,
+                    parent_global_step=parent_global_step,
                     source_global_step=int(source["global_step"]) if args.resume else 0)
     if rank == 0:
         (args.output / "preparation.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -1068,6 +1274,15 @@ def main() -> None:
         optimizer = torch.optim.AdamW(parameter_groups, lr=peak_lr,
                                       weight_decay=float(options["weight_decay"]),
                                       fused=device.type == "cuda")
+        if phase_optimizer is not None:
+            optimizer_audit = restore_optimizer_adding_level_parameters(
+                optimizer, phase_optimizer, parameter_names, source_parameter_names)
+            if rank == 0:
+                (args.output / "optimizer_transfer.json").write_text(json.dumps(optimizer_audit, indent=2))
+            phase_lrs = [peak_lr] + ([float(options["smiles_learning_rate"])] if text_parameters else [])
+            for group, phase_lr in zip(optimizer.param_groups, phase_lrs, strict=True):
+                group["lr"] = group["initial_lr"] = group["schedule_peak_lr"] = phase_lr
+        del phase_optimizer
         if args.resume:
             resumed = resume_state
             if resumed.get("training_kind") != "relative-image-feedback-rollout":
@@ -1075,7 +1290,10 @@ def main() -> None:
             previous_mode = resumed["config"].get("relative_image_rollout", {}).get("loss_mode", "legacy")
             if previous_mode != options.get("loss_mode", "legacy"):
                 raise ValueError("objective changed; use --warm-start and a new output directory, not --resume")
-            optimizer.load_state_dict(resumed["optimizer"])
+            optimizer_audit = restore_optimizer_adding_level_parameters(
+                optimizer, resumed["optimizer"], parameter_names, source_parameter_names)
+            if rank == 0:
+                (args.output / "optimizer_transfer.json").write_text(json.dumps(optimizer_audit, indent=2))
             complete = resumed.get("epoch_complete", True)
             start_epoch = int(resumed["epoch"]) + int(complete)
             resume_microbatch = 0 if complete else int(resumed["next_microbatch"])
@@ -1108,12 +1326,28 @@ def main() -> None:
                             purge_step=global_step + 1 if args.resume else None)
               if rank == 0 and not args.prepare_only else None)
     control_every = int(options.get("condition_control_every_epochs", 0))
-    if control_every and args.resume and not args.prepare_only:
+    if (options.get("validate_before_training", False) and not args.prepare_only
+            and (not args.resume or not (args.output / "validation_baseline.json").exists())):
+        baseline, preview = validation_suite(
+            rollout, condition_module, val_loader, schedule, distance, config, options,
+            device, text_model=text_model,
+        )
+        if writer:
+            (args.output / "validation_baseline.json").write_text(json.dumps(baseline, indent=2), encoding="utf-8")
+            for key, value in baseline.items():
+                writer.add_scalar(f"validation/{key}", value, global_step)
+            writer.add_images("samples/GT_input_finalZero_Random1to4", preview, global_step)
+            writer.flush()
+            print(f"validation_baseline {json.dumps(baseline)}", flush=True)
+    if control_every and (args.resume or options.get("validate_before_training", False)) and not args.prepare_only:
         baseline = condition_control_metrics(
             rollout, condition_module, val_loader, schedule, options, device, text_model,
         )
         if writer:
-            (args.output / "condition_control_baseline.json").write_text(
+            baseline_name = (f"condition_control_resume_step-{global_step:07d}.json"
+                             if args.resume and (args.output / "condition_control_baseline.json").exists()
+                             else "condition_control_baseline.json")
+            (args.output / baseline_name).write_text(
                 json.dumps(baseline, indent=2), encoding="utf-8")
             for key, value in baseline.items():
                 writer.add_scalar(f"condition_control/{key}", value, global_step)
@@ -1134,6 +1368,8 @@ def main() -> None:
         count = 0
         window_start, window_count = time.perf_counter(), 0
         for micro, batch in enumerate(train_loader):
+            if micro >= epoch_microbatches:
+                break
             if epoch == start_epoch and micro < resume_microbatch:
                 continue
             if args.smoke_test and micro >= 2 * accumulation:
@@ -1148,15 +1384,16 @@ def main() -> None:
                     torch.cuda.reset_peak_memory_stats()
             begin = time.perf_counter()
             clean = batch["field"].to(device, non_blocking=True)
-            start = torch.randint(0, len(schedule.alpha_bar), (len(clean),), device=device)
+            start = sampled_training_levels(schedule, len(clean), device, options,
+                                            probabilities=level_probabilities)
             if options.get("loss_mode", "legacy") == "legacy":
                 initial, targets, levels, target_mean, posterior_noise_rms = trajectory_targets(schedule, clean, start,
                     int(options["steps"]), int(options["random_samples"]), config, return_moments=True)
             else:
                 initial, levels = rollout_initial_and_levels(schedule, clean, start, int(options["steps"]), config)
             noise = sample_rollout_noise(initial, cloud, int(options["steps"]), int(options["random_samples"]))
-            should_step = (micro + 1) % accumulation == 0 or micro + 1 == len(train_loader)
-            group_size = min(accumulation, len(train_loader) - (micro // accumulation) * accumulation)
+            should_step = (micro + 1) % accumulation == 0 or micro + 1 == epoch_microbatches
+            group_size = min(accumulation, epoch_microbatches - (micro // accumulation) * accumulation)
             with ExitStack() as stack:
                 if world > 1 and not should_step and not args.prepare_only:
                     stack.enter_context(runner.no_sync())
@@ -1166,7 +1403,8 @@ def main() -> None:
                 with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     condition = _condition_from_batch(condition_runner, batch, device)
                     fields = runner(initial, **condition_arguments(condition), steps=int(options["steps"]),
-                                    random_samples=int(options["random_samples"]), noise=noise)
+                                    random_samples=int(options["random_samples"]), noise=noise,
+                                    **level_arguments(cloud, start, levels))
                     if options.get("loss_mode") == "zero_current_global_vp_ustat":
                         targets, target_mean, posterior_noise_rms = current_mean_global_vp_targets(
                             schedule, clean, start, levels, int(options["random_samples"]))
@@ -1244,7 +1482,7 @@ def main() -> None:
                           f"zero_mse={float(losses[center_key].detach()):.5f}"
                           f"{geometry_log}{smiles_log} speed={speed:.2f}mol/s", flush=True)
                     window_start, window_count = time.perf_counter(), 0
-                if global_step >= max_steps:
+                if global_step >= max_steps or micro + 1 >= epoch_microbatches:
                     break
         if args.prepare_only:
             for parameter in parameters:
@@ -1271,7 +1509,7 @@ def main() -> None:
                     (args.output / "condition_control.json").write_text(json.dumps(control, indent=2), encoding="utf-8")
             break
         train_means = {key: _distributed_mean(value, count, device) for key, value in totals.items()}
-        validation, preview = validate(rollout, condition_module, val_loader, schedule,
+        validation, preview = validation_suite(rollout, condition_module, val_loader, schedule,
                                         distance, config, options, device,
                                         max_batches=1 if args.smoke_test else None,
                                         text_model=text_model)
@@ -1308,13 +1546,17 @@ def main() -> None:
                         "parallel_smiles": (None if text_model is None else text_model.state_dict()),
                         "smiles_vocabulary": (None if tokenizer is None else tokenizer.id_to_token),
                         "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                        "optimizer_parameter_names": parameter_names,
                         "epoch": epoch, "global_step": global_step, "config": config,
-                        "epoch_complete": micro + 1 == len(train_loader), "next_microbatch": micro + 1,
+                        "epoch_complete": micro + 1 >= epoch_microbatches, "next_microbatch": micro + 1,
+                        "parent_global_step": parent_global_step,
                         "rng_states": rng_states,
                 "source_checkpoint": str(checkpoint_path) if checkpoint_path else None,
                         "training_kind": "relative-image-feedback-rollout-smoke" if args.smoke_test else "relative-image-feedback-rollout"}, temporary)
             os.replace(temporary, path)
             _update_latest(path, args.output / "latest.pt")
+            (args.output / f"validation-step-{global_step:07d}.json").write_text(
+                json.dumps(validation, indent=2), encoding="utf-8")
             writer.flush()
             long_preview = long_rollout_preview(rollout, condition_module, val_loader, schedule, options, device)
             if long_preview is not None:
